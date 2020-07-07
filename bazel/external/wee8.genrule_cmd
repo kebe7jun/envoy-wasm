@@ -102,8 +102,8 @@ else
   ninja=$$(command -v ninja)
 fi
 "$$gn" gen out/wee8 --args="$$WEE8_BUILD_ARGS"
-"$$ninja" -C out/wee8 wee8
+# "$$ninja" -C out/wee8 wee8
 
 # Move compiled library to the expected destinations.
 popd
-mv $$ROOT/wee8/out/wee8/obj/libwee8.a $(execpath libwee8.a)
+mv /libwee8.a $(execpath libwee8.a)
