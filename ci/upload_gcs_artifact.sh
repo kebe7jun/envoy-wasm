@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# Do not ever set -x here, it is a security hazard as it will place the credentials below in the
-# CI logs.
 set -e -o pipefail
 
 if [[ -z "${GCS_ARTIFACT_BUCKET}" ]]; then
@@ -10,7 +8,7 @@ if [[ -z "${GCS_ARTIFACT_BUCKET}" ]]; then
 fi
 
 # Fail when service account key is not specified
-echo ${GCP_SERVICE_ACCOUNT_KEY} | base64 --decode | gcloud auth activate-service-account --key-file=-
+bash -c 'echo ${GCP_SERVICE_ACCOUNT_KEY}' | base64 --decode | gcloud auth activate-service-account --key-file=-
 
 SOURCE_DIRECTORY="$1"
 TARGET_SUFFIX="$2"
@@ -24,5 +22,5 @@ BRANCH=${SYSTEM_PULLREQUEST_PULLREQUESTNUMBER:-${BUILD_SOURCEBRANCHNAME}}
 GCS_LOCATION="${GCS_ARTIFACT_BUCKET}/${BRANCH}/${TARGET_SUFFIX}"
 
 echo "Uploading to gs://${GCS_LOCATION} ..."
-gsutil -mq rsync -dr ${SOURCE_DIRECTORY} gs://${GCS_LOCATION}
+gsutil -mq rsync -dr "${SOURCE_DIRECTORY}" "gs://${GCS_LOCATION}"
 echo "Artifacts uploaded to: https://storage.googleapis.com/${GCS_LOCATION}/index.html"

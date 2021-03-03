@@ -242,6 +242,9 @@ void Http2UpstreamIntegrationTest::manySimultaneousRequests(uint32_t request_byt
       EXPECT_EQ("503", responses[i]->headers().getStatusValue());
     }
   }
+
+  EXPECT_EQ(0, test_server_->gauge("http2.streams_active")->value());
+  EXPECT_EQ(0, test_server_->gauge("http2.pending_send_bytes")->value());
 }
 
 TEST_P(Http2UpstreamIntegrationTest, ManySimultaneousRequest) {
@@ -327,18 +330,19 @@ TEST_P(Http2UpstreamIntegrationTest, HittingEncoderFilterLimitForGrpc) {
         const std::string access_log_name =
             TestEnvironment::temporaryPath(TestUtility::uniqueFilename());
         // Configure just enough of an upstream access log to reference the upstream headers.
-        const std::string yaml_string = R"EOF(
+        const std::string yaml_string = fmt::format(R"EOF(
 name: router
 typed_config:
   "@type": type.googleapis.com/envoy.config.filter.http.router.v2.Router
   upstream_log:
     name: accesslog
     filter:
-      not_health_check_filter: {}
+      not_health_check_filter: {{}}
     typed_config:
       "@type": type.googleapis.com/envoy.config.accesslog.v2.FileAccessLog
-      path: /dev/null
-  )EOF";
+      path: {}
+  )EOF",
+                                                    Platform::null_device_path);
         TestUtility::loadFromYaml(yaml_string, *hcm.mutable_http_filters(1));
       });
 
@@ -369,7 +373,6 @@ typed_config:
 
   // Now send an overly large response body. At some point, too much data will
   // be buffered, the stream will be reset, and the connection will disconnect.
-  fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
   upstream_request_->encodeData(1024 * 65, false);
   ASSERT_TRUE(upstream_request_->waitForReset());
   ASSERT_TRUE(fake_upstream_connection_->close());

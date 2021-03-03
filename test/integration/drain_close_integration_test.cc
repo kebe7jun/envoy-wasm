@@ -79,7 +79,6 @@ TEST_P(DrainCloseIntegrationTest, AdminGracefulDrain) {
   drain_strategy_ = Server::DrainStrategy::Immediate;
   drain_time_ = std::chrono::seconds(999);
   initialize();
-  fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
   uint32_t http_port = lookupPort("http");
   codec_client_ = makeHttpConnection(http_port);
 
@@ -116,7 +115,7 @@ TEST_P(DrainCloseIntegrationTest, AdminGracefulDrain) {
   }
 
   // New connections can still be made.
-  auto second_codec_client_ = makeRawHttpConnection(makeClientConnection(http_port));
+  auto second_codec_client_ = makeRawHttpConnection(makeClientConnection(http_port), absl::nullopt);
   EXPECT_TRUE(second_codec_client_->connected());
 
   // Invoke /drain_listeners and shut down listeners.
@@ -126,10 +125,7 @@ TEST_P(DrainCloseIntegrationTest, AdminGracefulDrain) {
   EXPECT_EQ(admin_response->headers().Status()->value().getStringView(), "200");
 
   test_server_->waitForCounterEq("listener_manager.listener_stopped", 1);
-  EXPECT_NO_THROW(Network::TcpListenSocket(
-      Network::Utility::getAddressWithPort(*Network::Test::getCanonicalLoopbackAddress(version_),
-                                           http_port),
-      nullptr, true));
+  ASSERT_TRUE(waitForPortAvailable(http_port));
 }
 
 TEST_P(DrainCloseIntegrationTest, RepeatedAdminGracefulDrain) {
@@ -137,7 +133,6 @@ TEST_P(DrainCloseIntegrationTest, RepeatedAdminGracefulDrain) {
   // behaviour isn't conflated with whether the drain sequence has started.
   drain_time_ = std::chrono::seconds(999);
   initialize();
-  fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
   uint32_t http_port = lookupPort("http");
   codec_client_ = makeHttpConnection(http_port);
 
@@ -169,10 +164,7 @@ TEST_P(DrainCloseIntegrationTest, RepeatedAdminGracefulDrain) {
   EXPECT_EQ(admin_response->headers().Status()->value().getStringView(), "200");
 
   test_server_->waitForCounterEq("listener_manager.listener_stopped", 1);
-  EXPECT_NO_THROW(Network::TcpListenSocket(
-      Network::Utility::getAddressWithPort(*Network::Test::getCanonicalLoopbackAddress(version_),
-                                           http_port),
-      nullptr, true));
+  ASSERT_TRUE(waitForPortAvailable(http_port));
 }
 
 INSTANTIATE_TEST_SUITE_P(Protocols, DrainCloseIntegrationTest,

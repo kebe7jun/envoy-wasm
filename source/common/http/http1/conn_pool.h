@@ -17,10 +17,10 @@ namespace Http1 {
  *       address. Higher layer code should handle resolving DNS on error and creating a new pool
  *       bound to a different IP address.
  */
-class ConnPoolImpl : public Envoy::Http::ConnPoolImplBase {
+class ConnPoolImpl : public Http::HttpConnPoolImplBase {
 public:
-  ConnPoolImpl(Event::Dispatcher& dispatcher, Upstream::HostConstSharedPtr host,
-               Upstream::ResourcePriority priority,
+  ConnPoolImpl(Event::Dispatcher& dispatcher, Random::RandomGenerator& random_generator,
+               Upstream::HostConstSharedPtr host, Upstream::ResourcePriority priority,
                const Network::ConnectionSocket::OptionsSharedPtr& options,
                const Network::TransportSocketOptionsSharedPtr& transport_socket_options);
 
@@ -30,7 +30,7 @@ public:
   Http::Protocol protocol() const override { return Http::Protocol::Http11; }
 
   // ConnPoolImplBase
-  ActiveClientPtr instantiateActiveClient() override;
+  Envoy::ConnectionPool::ActiveClientPtr instantiateActiveClient() override;
 
 protected:
   class ActiveClient;
@@ -71,8 +71,7 @@ protected:
     ConnPoolImpl& parent() { return static_cast<ConnPoolImpl&>(parent_); }
 
     // ConnPoolImplBase::ActiveClient
-    bool hasActiveRequests() const override;
-    bool closingWithIncompleteRequest() const override;
+    bool closingWithIncompleteStream() const override;
     RequestEncoder& newStreamEncoder(ResponseDecoder& response_decoder) override;
 
     StreamWrapperPtr stream_wrapper_;
@@ -81,8 +80,9 @@ protected:
   void onDownstreamReset(ActiveClient& client);
   void onResponseComplete(ActiveClient& client);
 
-  Event::TimerPtr upstream_ready_timer_;
+  Event::SchedulableCallbackPtr upstream_ready_cb_;
   bool upstream_ready_enabled_{false};
+  Random::RandomGenerator& random_generator_;
 };
 
 /**
@@ -90,19 +90,15 @@ protected:
  */
 class ProdConnPoolImpl : public ConnPoolImpl {
 public:
-  ProdConnPoolImpl(Event::Dispatcher& dispatcher, Upstream::HostConstSharedPtr host,
-                   Upstream::ResourcePriority priority,
-                   const Network::ConnectionSocket::OptionsSharedPtr& options,
-                   const Network::TransportSocketOptionsSharedPtr& transport_socket_options)
-      : ConnPoolImpl(dispatcher, host, priority, options, transport_socket_options) {}
+  using ConnPoolImpl::ConnPoolImpl;
 
   // ConnPoolImpl
   CodecClientPtr createCodecClient(Upstream::Host::CreateConnectionData& data) override;
 };
 
 ConnectionPool::InstancePtr
-allocateConnPool(Event::Dispatcher& dispatcher, Upstream::HostConstSharedPtr host,
-                 Upstream::ResourcePriority priority,
+allocateConnPool(Event::Dispatcher& dispatcher, Random::RandomGenerator& random_generator,
+                 Upstream::HostConstSharedPtr host, Upstream::ResourcePriority priority,
                  const Network::ConnectionSocket::OptionsSharedPtr& options,
                  const Network::TransportSocketOptionsSharedPtr& transport_socket_options);
 

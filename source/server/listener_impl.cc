@@ -3,18 +3,23 @@
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/config/listener/v3/listener_components.pb.h"
+#include "envoy/extensions/filters/listener/proxy_protocol/v3/proxy_protocol.pb.h"
 #include "envoy/network/exception.h"
+#include "envoy/network/udp_packet_writer_config.h"
 #include "envoy/registry/registry.h"
 #include "envoy/server/active_udp_listener_config.h"
 #include "envoy/server/transport_socket_config.h"
 #include "envoy/stats/scope.h"
 
 #include "common/access_log/access_log_impl.h"
+#include "common/api/os_sys_calls_impl.h"
 #include "common/common/assert.h"
 #include "common/config/utility.h"
 #include "common/network/connection_balancer_impl.h"
 #include "common/network/resolver_impl.h"
 #include "common/network/socket_option_factory.h"
+#include "common/network/socket_option_impl.h"
+#include "common/network/udp_listener_impl.h"
 #include "common/network/utility.h"
 #include "common/protobuf/utility.h"
 #include "common/runtime/runtime_features.h"
@@ -167,9 +172,6 @@ Http::Context& ListenerFactoryContextBaseImpl::httpContext() { return server_.ht
 const LocalInfo::LocalInfo& ListenerFactoryContextBaseImpl::localInfo() const {
   return server_.localInfo();
 }
-Envoy::Runtime::RandomGenerator& ListenerFactoryContextBaseImpl::random() {
-  return server_.random();
-}
 Envoy::Runtime::Loader& ListenerFactoryContextBaseImpl::runtime() { return server_.runtime(); }
 Stats::Scope& ListenerFactoryContextBaseImpl::scope() { return *global_scope_; }
 Singleton::Manager& ListenerFactoryContextBaseImpl::singletonManager() {
@@ -229,6 +231,8 @@ ListenerImpl::ListenerImpl(const envoy::config::listener::v3::Listener& config,
           PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, per_connection_buffer_limit_bytes, 1024 * 1024)),
       listener_tag_(parent_.factory_.nextListenerTag()), name_(name), added_via_api_(added_via_api),
       workers_started_(workers_started), hash_(hash),
+      tcp_backlog_size_(
+          PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, tcp_backlog_size, ENVOY_TCP_BACKLOG_SIZE)),
       validation_visitor_(
           added_via_api_ ? parent_.server_.messageValidationContext().dynamicValidationVisitor()
                          : parent_.server_.messageValidationContext().staticValidationVisitor()),
@@ -245,6 +249,11 @@ ListenerImpl::ListenerImpl(const envoy::config::listener::v3::Listener& config,
           parent.factory_.createDrainManager(config.drain_type()))),
       filter_chain_manager_(address_, listener_factory_context_->parentFactoryContext(),
                             initManager()),
+      cx_limit_runtime_key_("envoy.resource_limits.listener." + config_.name() +
+                            ".connection_limit"),
+      open_connections_(std::make_shared<BasicResourceLimitImpl>(
+          std::numeric_limits<uint64_t>::max(), listener_factory_context_->runtime(),
+          cx_limit_runtime_key_)),
       local_init_watcher_(fmt::format("Listener-local-init-watcher {}", name), [this] {
         if (workers_started_) {
           parent_.onListenerWarmed(*this);
@@ -254,10 +263,21 @@ ListenerImpl::ListenerImpl(const envoy::config::listener::v3::Listener& config,
           listener_init_target_.ready();
         }
       }) {
+
+  const absl::optional<std::string> runtime_val =
+      listener_factory_context_->runtime().snapshot().get(cx_limit_runtime_key_);
+  if (runtime_val && runtime_val->empty()) {
+    ENVOY_LOG(warn,
+              "Listener connection limit runtime key {} is empty. There are currently no "
+              "limitations on the number of accepted connections for listener {}.",
+              cx_limit_runtime_key_, config_.name());
+  }
+
   buildAccessLog();
   auto socket_type = Network::Utility::protobufAddressSocketType(config.address());
   buildListenSocketOptions(socket_type);
   buildUdpListenerFactory(socket_type, concurrency);
+  buildUdpWriterFactory(socket_type);
   createListenerFilterFactories(socket_type);
   validateFilterChains(socket_type);
   buildFilterChains();
@@ -277,7 +297,7 @@ ListenerImpl::ListenerImpl(const envoy::config::listener::v3::Listener& config,
   }
 }
 
-ListenerImpl::ListenerImpl(const ListenerImpl& origin,
+ListenerImpl::ListenerImpl(ListenerImpl& origin,
                            const envoy::config::listener::v3::Listener& config,
                            const std::string& version_info, ListenerManagerImpl& parent,
                            const std::string& name, bool added_via_api, bool workers_started,
@@ -290,6 +310,8 @@ ListenerImpl::ListenerImpl(const ListenerImpl& origin,
           PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, per_connection_buffer_limit_bytes, 1024 * 1024)),
       listener_tag_(origin.listener_tag_), name_(name), added_via_api_(added_via_api),
       workers_started_(workers_started), hash_(hash),
+      tcp_backlog_size_(
+          PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, tcp_backlog_size, ENVOY_TCP_BACKLOG_SIZE)),
       validation_visitor_(
           added_via_api_ ? parent_.server_.messageValidationContext().dynamicValidationVisitor()
                          : parent_.server_.messageValidationContext().staticValidationVisitor()),
@@ -301,6 +323,7 @@ ListenerImpl::ListenerImpl(const ListenerImpl& origin,
       listener_filters_timeout_(
           PROTOBUF_GET_MS_OR_DEFAULT(config, listener_filters_timeout, 15000)),
       continue_on_listener_filters_timeout_(config.continue_on_listener_filters_timeout()),
+      connection_balancer_(origin.connection_balancer_),
       listener_factory_context_(std::make_shared<PerListenerFactoryContextImpl>(
           origin.listener_factory_context_->listener_factory_context_base_, this, *this)),
       filter_chain_manager_(address_, origin.listener_factory_context_->parentFactoryContext(),
@@ -313,6 +336,7 @@ ListenerImpl::ListenerImpl(const ListenerImpl& origin,
   auto socket_type = Network::Utility::protobufAddressSocketType(config.address());
   buildListenSocketOptions(socket_type);
   buildUdpListenerFactory(socket_type, concurrency);
+  buildUdpWriterFactory(socket_type);
   createListenerFilterFactories(socket_type);
   validateFilterChains(socket_type);
   buildFilterChains();
@@ -321,6 +345,7 @@ ListenerImpl::ListenerImpl(const ListenerImpl& origin,
   buildOriginalDstListenerFilter();
   buildProxyProtocolListenerFilter();
   buildTlsInspectorListenerFilter();
+  open_connections_ = origin.open_connections_;
 }
 
 void ListenerImpl::buildAccessLog() {
@@ -350,10 +375,36 @@ void ListenerImpl::buildUdpListenerFactory(Network::Socket::Type socket_type,
     ProtobufTypes::MessagePtr message =
         Config::Utility::translateToFactoryConfig(udp_config, validation_visitor_, config_factory);
     udp_listener_factory_ = config_factory.createActiveUdpListenerFactory(*message, concurrency);
+
+    udp_listener_worker_router_ =
+        std::make_unique<Network::UdpListenerWorkerRouterImpl>(concurrency);
+  }
+}
+
+void ListenerImpl::buildUdpWriterFactory(Network::Socket::Type socket_type) {
+  if (socket_type == Network::Socket::Type::Datagram) {
+    auto udp_writer_config = config_.udp_writer_config();
+    if (!Api::OsSysCallsSingleton::get().supportsUdpGso() ||
+        udp_writer_config.typed_config().type_url().empty()) {
+      const std::string default_type_url =
+          "type.googleapis.com/envoy.config.listener.v3.UdpDefaultWriterOptions";
+      udp_writer_config.mutable_typed_config()->set_type_url(default_type_url);
+    }
+    auto& config_factory =
+        Config::Utility::getAndCheckFactory<Network::UdpPacketWriterConfigFactory>(
+            udp_writer_config);
+    ProtobufTypes::MessagePtr message = Config::Utility::translateAnyToFactoryConfig(
+        udp_writer_config.typed_config(), validation_visitor_, config_factory);
+    udp_writer_factory_ = config_factory.createUdpPacketWriterFactory(*message);
   }
 }
 
 void ListenerImpl::buildListenSocketOptions(Network::Socket::Type socket_type) {
+  // The process-wide `signal()` handling may fail to handle SIGPIPE if overridden
+  // in the process (i.e., on a mobile client). Some OSes support handling it at the socket layer:
+  if (ENVOY_SOCKET_SO_NOSIGPIPE.hasValue()) {
+    addListenSocketOptions(Network::SocketOptionFactory::buildSocketNoSigpipeOptions());
+  }
   if (PROTOBUF_GET_WRAPPED_OR_DEFAULT(config_, transparent, false)) {
     addListenSocketOptions(Network::SocketOptionFactory::buildIpTransparentOptions());
   }
@@ -372,6 +423,11 @@ void ListenerImpl::buildListenSocketOptions(Network::Socket::Type socket_type) {
     addListenSocketOptions(Network::SocketOptionFactory::buildIpPacketInfoOptions());
     // Needed to return receive buffer overflown indicator.
     addListenSocketOptions(Network::SocketOptionFactory::buildRxQueueOverFlowOptions());
+    // TODO(yugant) : Add a config option for UDP_GRO
+    if (Api::OsSysCallsSingleton::get().supportsUdpGro()) {
+      // Needed to receive gso_size option
+      addListenSocketOptions(Network::SocketOptionFactory::buildUdpGroOptions());
+    }
   }
 }
 
@@ -422,8 +478,8 @@ void ListenerImpl::buildFilterChains() {
   Server::Configuration::TransportSocketFactoryContextImpl transport_factory_context(
       parent_.server_.admin(), parent_.server_.sslContextManager(), listenerScope(),
       parent_.server_.clusterManager(), parent_.server_.localInfo(), parent_.server_.dispatcher(),
-      parent_.server_.random(), parent_.server_.stats(), parent_.server_.singletonManager(),
-      parent_.server_.threadLocal(), validation_visitor_, parent_.server_.api());
+      parent_.server_.stats(), parent_.server_.singletonManager(), parent_.server_.threadLocal(),
+      validation_visitor_, parent_.server_.api());
   transport_factory_context.setInitManager(*dynamic_init_manager_);
   // The init manager is a little messy. Will refactor when filter chain manager could accept
   // network filter chain update.
@@ -434,12 +490,15 @@ void ListenerImpl::buildFilterChains() {
 
 void ListenerImpl::buildSocketOptions() {
   // TCP specific setup.
-  if (config_.has_connection_balance_config()) {
-    // Currently exact balance is the only supported type and there are no options.
-    ASSERT(config_.connection_balance_config().has_exact_balance());
-    connection_balancer_ = std::make_unique<Network::ExactConnectionBalancerImpl>();
-  } else {
-    connection_balancer_ = std::make_unique<Network::NopConnectionBalancerImpl>();
+  if (connection_balancer_ == nullptr) {
+    // Not in place listener update.
+    if (config_.has_connection_balance_config()) {
+      // Currently exact balance is the only supported type and there are no options.
+      ASSERT(config_.connection_balance_config().has_exact_balance());
+      connection_balancer_ = std::make_shared<Network::ExactConnectionBalancerImpl>();
+    } else {
+      connection_balancer_ = std::make_shared<Network::NopConnectionBalancerImpl>();
+    }
   }
 
   if (config_.has_tcp_fast_open_queue_length()) {
@@ -471,7 +530,7 @@ void ListenerImpl::buildProxyProtocolListenerFilter() {
         Config::Utility::getAndCheckFactoryByName<Configuration::NamedListenerFilterConfigFactory>(
             Extensions::ListenerFilters::ListenerFilterNames::get().ProxyProtocol);
     listener_filter_factories_.push_back(factory.createListenerFilterFactoryFromProto(
-        Envoy::ProtobufWkt::Empty(),
+        envoy::extensions::filters::listener::proxy_protocol::v3::ProxyProtocol(),
         /*listener_filter_matcher=*/nullptr, *listener_factory_context_));
   }
 }
@@ -520,9 +579,6 @@ Http::Context& PerListenerFactoryContextImpl::httpContext() {
 }
 const LocalInfo::LocalInfo& PerListenerFactoryContextImpl::localInfo() const {
   return listener_factory_context_base_->localInfo();
-}
-Envoy::Runtime::RandomGenerator& PerListenerFactoryContextImpl::random() {
-  return listener_factory_context_base_->random();
 }
 Envoy::Runtime::Loader& PerListenerFactoryContextImpl::runtime() {
   return listener_factory_context_base_->runtime();

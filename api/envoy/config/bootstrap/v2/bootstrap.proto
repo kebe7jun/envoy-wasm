@@ -32,7 +32,7 @@ option (udpa.annotations.file_status).package_version_status = FROZEN;
 // of the Envoy v2 configuration. See the :ref:`v2 configuration overview
 // <config_overview_bootstrap>` for more detail.
 
-// Bootstrap :ref:`configuration overview <config_overview_v2_bootstrap>`.
+// Bootstrap :ref:`configuration overview <config_overview_bootstrap>`.
 // [#next-free-field: 21]
 message Bootstrap {
   message StaticResources {
@@ -169,6 +169,9 @@ message Bootstrap {
   // when :ref:`dns_resolvers <envoy_api_field_Cluster.dns_resolvers>` and
   // :ref:`use_tcp_for_dns_lookups <envoy_api_field_Cluster.use_tcp_for_dns_lookups>` are
   // specified.
+  // Setting this value causes failure if the
+  // ``envoy.restart_features.use_apple_api_for_dns_lookups`` runtime value is true during
+  // server startup. Apple' API only uses UDP for DNS resolution.
   bool use_tcp_for_dns_lookups = 20;
 }
 

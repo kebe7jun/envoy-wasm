@@ -6,7 +6,9 @@
 
 #include "envoy/access_log/access_log.h"
 #include "envoy/buffer/buffer.h"
+#include "envoy/extensions/wasm/v3/wasm.pb.validate.h"
 #include "envoy/http/filter.h"
+#include "envoy/stats/sink.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/common/assert.h"
@@ -26,7 +28,6 @@ namespace Wasm {
 using proxy_wasm::BufferInterface;
 using proxy_wasm::CloseType;
 using proxy_wasm::ContextBase;
-using proxy_wasm::MetricType;
 using proxy_wasm::Pairs;
 using proxy_wasm::PairsWithStringValues;
 using proxy_wasm::PluginBase;
@@ -38,8 +39,8 @@ using proxy_wasm::WasmHandleBase;
 using proxy_wasm::WasmHeaderMapType;
 using proxy_wasm::WasmResult;
 using proxy_wasm::WasmStreamType;
-using proxy_wasm::Word;
 
+using VmConfig = envoy::extensions::wasm::v3::VmConfig;
 using GrpcService = envoy::config::core::v3::GrpcService;
 
 class Wasm;
@@ -96,12 +97,12 @@ private:
 // Plugin contains the information for a filter/service.
 struct Plugin : public PluginBase {
   Plugin(absl::string_view name, absl::string_view root_id, absl::string_view vm_id,
-         absl::string_view plugin_configuration, bool fail_open,
+         absl::string_view runtime, absl::string_view plugin_configuration, bool fail_open,
          envoy::config::core::v3::TrafficDirection direction,
          const LocalInfo::LocalInfo& local_info,
          const envoy::config::core::v3::Metadata* listener_metadata)
-      : PluginBase(name, root_id, vm_id, plugin_configuration, fail_open), direction_(direction),
-        local_info_(local_info), listener_metadata_(listener_metadata) {}
+      : PluginBase(name, root_id, vm_id, runtime, plugin_configuration, fail_open),
+        direction_(direction), local_info_(local_info), listener_metadata_(listener_metadata) {}
 
   envoy::config::core::v3::TrafficDirection direction_;
   const LocalInfo::LocalInfo& local_info_;
@@ -130,7 +131,6 @@ public:
   Plugin* plugin() const;
   Context* rootContext() const;
   Upstream::ClusterManager& clusterManager() const;
-  Buffer& buffer() { return buffer_; }
 
   // proxy_wasm::ContextBase
   void error(absl::string_view message) override;
@@ -150,7 +150,7 @@ public:
   const Network::Connection* getConnection() const;
 
   //
-  // VM level downcalls into the Wasm code on Context(id == 0).
+  // VM level down-calls into the Wasm code on Context(id == 0).
   //
   virtual bool validateConfiguration(absl::string_view configuration,
                                      const std::shared_ptr<PluginBase>& plugin); // deprecated
@@ -160,6 +160,8 @@ public:
            const Http::ResponseHeaderMap* response_headers,
            const Http::ResponseTrailerMap* response_trailers,
            const StreamInfo::StreamInfo& stream_info) override;
+
+  uint32_t getLogLevel() override;
 
   // Network::ConnectionCallbacks
   void onEvent(Network::ConnectionEvent event) override;
@@ -205,6 +207,7 @@ public:
   // General
   WasmResult log(uint32_t level, absl::string_view message) override;
   uint64_t getCurrentTimeNanoseconds() override;
+  absl::string_view getConfiguration() override;
   std::pair<uint32_t, absl::string_view> getStatus() override;
 
   // State accessors
@@ -219,6 +222,11 @@ public:
   WasmResult sendLocalResponse(uint32_t response_code, absl::string_view body_text,
                                Pairs additional_headers, uint32_t grpc_status,
                                absl::string_view details) override;
+  void clearRouteCache() override {
+    if (decoder_callbacks_) {
+      decoder_callbacks_->clearRouteCache();
+    }
+  }
 
   // Header/Trailer/Metadata Maps
   WasmResult addHeaderMapValue(WasmHeaderMapType type, absl::string_view key,
@@ -245,8 +253,7 @@ public:
                       int timeout_millisconds, uint32_t* token_ptr) override;
 
   // Stats/Metrics
-  WasmResult defineMetric(MetricType type, absl::string_view name,
-                          uint32_t* metric_id_ptr) override;
+  WasmResult defineMetric(uint32_t type, absl::string_view name, uint32_t* metric_id_ptr) override;
   WasmResult incrementMetric(uint32_t metric_id, int64_t offset) override;
   WasmResult recordMetric(uint32_t metric_id, uint64_t value) override;
   WasmResult getMetric(uint32_t metric_id, uint64_t* value_ptr) override;
@@ -267,6 +274,8 @@ public:
   // Envoy specific ABI
   void onResolveDns(uint32_t token, Envoy::Network::DnsResolver::ResolutionStatus status,
                     std::list<Envoy::Network::DnsResponse>&& response);
+
+  void onStatsUpdate(Envoy::Stats::MetricSnapshot& snapshot);
 
   // CEL evaluation
   std::vector<const google::api::expr::runtime::CelFunction*>
@@ -300,22 +309,18 @@ public:
     }
     return dynamic_cast<T*>(it->second.get());
   }
-  bool hasForeignData(absl::string_view data_name) const {
-    return data_storage_.contains(data_name);
-  }
+
+  uint32_t nextGrpcCallToken();
+  uint32_t nextGrpcStreamToken();
+  uint32_t nextHttpCallToken();
+  void setNextGrpcTokenForTesting(uint32_t token) { next_grpc_token_ = token; }
+  void setNextHttpCallTokenForTesting(uint32_t token) { next_http_call_token_ = token; }
 
 protected:
   friend class Wasm;
 
   void addAfterVmCallAction(std::function<void()> f);
   void onCloseTCP();
-
-  virtual absl::string_view getConfiguration();
-  virtual void clearRouteCache() {
-    if (decoder_callbacks_) {
-      decoder_callbacks_->clearRouteCache();
-    }
-  }
 
   struct AsyncClientHandler : public Http::AsyncClient::Callbacks {
     // Http::AsyncClient::Callbacks
@@ -327,6 +332,9 @@ protected:
                    Http::AsyncClient::FailureReason reason) override {
       context_->onHttpCallFailure(token_, reason);
     }
+    void
+    onBeforeFinalizeUpstreamSpan(Envoy::Tracing::Span& /* span */,
+                                 const Http::ResponseHeaderMap* /* response_headers */) override {}
 
     Context* context_;
     uint32_t token_;
@@ -366,6 +374,7 @@ protected:
       context_->onGrpcReceiveTrailingMetadataWrapper(token_, std::move(metadata));
     }
     void onRemoteClose(Grpc::Status::GrpcStatus status, const std::string& message) override {
+      remote_closed_ = true;
       context_->onGrpcCloseWrapper(token_, status, message);
     }
 
@@ -373,6 +382,8 @@ protected:
     uint32_t token_;
     Grpc::RawAsyncClientPtr client_;
     Grpc::RawAsyncStream* stream_;
+    bool local_closed_ = false;
+    bool remote_closed_ = false;
   };
 
   void onHttpCallSuccess(uint32_t token, Envoy::Http::ResponseMessagePtr&& response);
@@ -385,8 +396,8 @@ protected:
   void onGrpcCloseWrapper(uint32_t token, const Grpc::Status::GrpcStatus& status,
                           const absl::string_view message);
 
-  bool IsGrpcStreamToken(uint32_t token) { return (token & 1) == 0; }
-  bool IsGrpcCallToken(uint32_t token) { return (token & 1) == 1; }
+  bool isGrpcStreamToken(uint32_t token) { return (token & 1) == 0; }
+  bool isGrpcCallToken(uint32_t token) { return (token & 1) == 1; }
 
   Http::HeaderMap* getMap(WasmHeaderMapType type);
   const Http::HeaderMap* getConstMap(WasmHeaderMapType type);
@@ -404,8 +415,7 @@ protected:
   Envoy::Http::StreamDecoderFilterCallbacks* decoder_callbacks_{};
   Envoy::Http::StreamEncoderFilterCallbacks* encoder_callbacks_{};
 
-  // General state. Only available (non-nullptr) during the calls requiring it (e.g. onConfigure()).
-  absl::string_view configuration_;
+  // Status.
   uint32_t status_code_{0};
   absl::string_view status_message_;
 
@@ -440,7 +450,6 @@ protected:
   const StreamInfo::StreamInfo* access_log_stream_info_{};
   const Http::RequestHeaderMap* access_log_request_headers_{};
   const Http::ResponseHeaderMap* access_log_response_headers_{};
-  const Http::RequestTrailerMap* access_log_request_trailers_{}; // unused
   const Http::ResponseTrailerMap* access_log_response_trailers_{};
 
   // Temporary state.

@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <ctime>
 #include <limits>
 #include <memory>
 #include <string>
@@ -10,6 +12,7 @@
 #include "envoy/http/codes.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/network/filter.h"
+#include "envoy/stats/sink.h"
 #include "envoy/thread_local/thread_local.h"
 
 #include "common/buffer/buffer_impl.h"
@@ -35,10 +38,12 @@
 #include "eval/eval/field_backed_list_impl.h"
 #include "eval/eval/field_backed_map_impl.h"
 #include "eval/public/cel_value.h"
-#include "eval/public/value_export_util.h"
 #include "openssl/bytestring.h"
 #include "openssl/hmac.h"
 #include "openssl/sha.h"
+
+using proxy_wasm::MetricType;
+using proxy_wasm::Word;
 
 namespace Envoy {
 namespace Extensions {
@@ -74,6 +79,8 @@ Http::RequestHeaderMapPtr buildRequestHeaderMapFromPairs(const Pairs& pairs) {
 }
 
 template <typename P> static uint32_t headerSize(const P& p) { return p ? p->size() : 0; }
+
+constexpr absl::string_view FailStreamResponseDetails = "wasm_fail_stream";
 
 } // namespace
 
@@ -166,7 +173,7 @@ void Context::onCloseTCP() {
 void Context::onResolveDns(uint32_t token, Envoy::Network::DnsResolver::ResolutionStatus status,
                            std::list<Envoy::Network::DnsResponse>&& response) {
   proxy_wasm::DeferAfterCallActions actions(this);
-  if (!wasm()->on_resolve_dns_) {
+  if (wasm()->isFailed() || !wasm()->on_resolve_dns_) {
     return;
   }
   if (status != Network::DnsResolver::ResolutionStatus::Success) {
@@ -202,9 +209,114 @@ void Context::onResolveDns(uint32_t token, Envoy::Network::DnsResolver::Resoluti
   wasm()->on_resolve_dns_(this, id_, token, s);
 }
 
-// Native serializer carrying over bit representation from CEL value to the extension
+template <typename I> inline uint32_t align(uint32_t i) {
+  return (i + sizeof(I) - 1) & ~(sizeof(I) - 1);
+}
+
+template <typename I> inline char* align(char* p) {
+  return reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(p) + sizeof(I) - 1) &
+                                 ~(sizeof(I) - 1));
+}
+
+void Context::onStatsUpdate(Envoy::Stats::MetricSnapshot& snapshot) {
+  proxy_wasm::DeferAfterCallActions actions(this);
+  if (wasm()->isFailed() || !wasm()->on_stats_update_) {
+    return;
+  }
+  // buffer format:
+  //  uint32 size of block of this type
+  //  uint32 type
+  //  uint32 count
+  //    uint32 length of name
+  //    name
+  //    8 byte alignment padding
+  //    8 bytes of absolute value
+  //    8 bytes of delta  (if appropriate, e.g. for counters)
+  //  uint32 size of block of this type
+
+  uint32_t counter_block_size = 3 * sizeof(uint32_t); // type of stat
+  uint32_t num_counters = snapshot.counters().size();
+  uint32_t counter_type = 1;
+
+  uint32_t gauge_block_size = 3 * sizeof(uint32_t); // type of stat
+  uint32_t num_gauges = snapshot.gauges().size();
+  uint32_t gauge_type = 2;
+
+  uint32_t n = 0;
+  uint64_t v = 0;
+
+  for (const auto& counter : snapshot.counters()) {
+    if (counter.counter_.get().used()) {
+      counter_block_size += sizeof(uint32_t) + counter.counter_.get().name().size();
+      counter_block_size = align<uint64_t>(counter_block_size + 2 * sizeof(uint64_t));
+    }
+  }
+
+  for (const auto& gauge : snapshot.gauges()) {
+    if (gauge.get().used()) {
+      gauge_block_size += sizeof(uint32_t) + gauge.get().name().size();
+      gauge_block_size += align<uint64_t>(gauge_block_size + sizeof(uint64_t));
+    }
+  }
+
+  auto buffer = std::unique_ptr<char[]>(new char[counter_block_size + gauge_block_size]);
+  char* b = buffer.get();
+
+  memcpy(b, &counter_block_size, sizeof(uint32_t));
+  b += sizeof(uint32_t);
+  memcpy(b, &counter_type, sizeof(uint32_t));
+  b += sizeof(uint32_t);
+  memcpy(b, &num_counters, sizeof(uint32_t));
+  b += sizeof(uint32_t);
+
+  for (const auto& counter : snapshot.counters()) {
+    if (counter.counter_.get().used()) {
+      n = counter.counter_.get().name().size();
+      memcpy(b, &n, sizeof(uint32_t));
+      b += sizeof(uint32_t);
+      memcpy(b, counter.counter_.get().name().data(), counter.counter_.get().name().size());
+      b = align<uint64_t>(b + counter.counter_.get().name().size());
+      v = counter.counter_.get().value();
+      memcpy(b, &v, sizeof(uint64_t));
+      b += sizeof(uint64_t);
+      v = counter.delta_;
+      memcpy(b, &v, sizeof(uint64_t));
+      b += sizeof(uint64_t);
+    }
+  }
+
+  memcpy(b, &gauge_block_size, sizeof(uint32_t));
+  b += sizeof(uint32_t);
+  memcpy(b, &gauge_type, sizeof(uint32_t));
+  b += sizeof(uint32_t);
+  memcpy(b, &num_gauges, sizeof(uint32_t));
+  b += sizeof(uint32_t);
+
+  for (const auto& gauge : snapshot.gauges()) {
+    if (gauge.get().used()) {
+      n = gauge.get().name().size();
+      memcpy(b, &n, sizeof(uint32_t));
+      b += sizeof(uint32_t);
+      memcpy(b, gauge.get().name().data(), gauge.get().name().size());
+      b = align<uint64_t>(b + gauge.get().name().size());
+      v = gauge.get().value();
+      memcpy(b, &v, sizeof(uint64_t));
+      b += sizeof(uint64_t);
+    }
+  }
+  buffer_.set(std::move(buffer), counter_block_size + gauge_block_size);
+  wasm()->on_stats_update_(this, id_, counter_block_size + gauge_block_size);
+}
+
+// Native serializer carrying over bit representation from CEL value to the extension.
+// This implementation assumes that the value type is static and known to the consumer.
 WasmResult serializeValue(Filters::Common::Expr::CelValue value, std::string* result) {
   using Filters::Common::Expr::CelValue;
+  int64_t out_int64;
+  uint64_t out_uint64;
+  double out_double;
+  bool out_bool;
+  const Protobuf::Message* out_message;
   switch (value.type()) {
   case CelValue::Type::kString:
     result->assign(value.StringOrDie().value().data(), value.StringOrDie().value().size());
@@ -212,72 +324,77 @@ WasmResult serializeValue(Filters::Common::Expr::CelValue value, std::string* re
   case CelValue::Type::kBytes:
     result->assign(value.BytesOrDie().value().data(), value.BytesOrDie().value().size());
     return WasmResult::Ok;
-  case CelValue::Type::kInt64: {
-    auto out = value.Int64OrDie();
-    result->assign(reinterpret_cast<const char*>(&out), sizeof(int64_t));
+  case CelValue::Type::kInt64:
+    out_int64 = value.Int64OrDie();
+    result->assign(reinterpret_cast<const char*>(&out_int64), sizeof(int64_t));
     return WasmResult::Ok;
-  }
-  case CelValue::Type::kUint64: {
-    auto out = value.Uint64OrDie();
-    result->assign(reinterpret_cast<const char*>(&out), sizeof(uint64_t));
+  case CelValue::Type::kUint64:
+    out_uint64 = value.Uint64OrDie();
+    result->assign(reinterpret_cast<const char*>(&out_uint64), sizeof(uint64_t));
     return WasmResult::Ok;
-  }
-  case CelValue::Type::kDouble: {
-    auto out = value.DoubleOrDie();
-    result->assign(reinterpret_cast<const char*>(&out), sizeof(double));
+  case CelValue::Type::kDouble:
+    out_double = value.DoubleOrDie();
+    result->assign(reinterpret_cast<const char*>(&out_double), sizeof(double));
     return WasmResult::Ok;
-  }
-  case CelValue::Type::kBool: {
-    auto out = value.BoolOrDie();
-    result->assign(reinterpret_cast<const char*>(&out), sizeof(bool));
+  case CelValue::Type::kBool:
+    out_bool = value.BoolOrDie();
+    result->assign(reinterpret_cast<const char*>(&out_bool), sizeof(bool));
     return WasmResult::Ok;
-  }
-  case CelValue::Type::kDuration: {
+  case CelValue::Type::kDuration:
     // Warning: loss of precision to nanoseconds
-    int64_t out = absl::ToInt64Nanoseconds(value.DurationOrDie());
-    result->assign(reinterpret_cast<const char*>(&out), sizeof(int64_t));
+    out_int64 = absl::ToInt64Nanoseconds(value.DurationOrDie());
+    result->assign(reinterpret_cast<const char*>(&out_int64), sizeof(int64_t));
     return WasmResult::Ok;
-  }
-  case CelValue::Type::kTimestamp: {
+  case CelValue::Type::kTimestamp:
     // Warning: loss of precision to nanoseconds
-    int64_t out = absl::ToUnixNanos(value.TimestampOrDie());
-    result->assign(reinterpret_cast<const char*>(&out), sizeof(int64_t));
+    out_int64 = absl::ToUnixNanos(value.TimestampOrDie());
+    result->assign(reinterpret_cast<const char*>(&out_int64), sizeof(int64_t));
     return WasmResult::Ok;
-  }
-  case CelValue::Type::kMessage: {
-    auto out = value.MessageOrDie();
-    if (out == nullptr) {
-      result->clear();
-      return WasmResult::Ok;
-    }
-    if (out->SerializeToString(result)) {
+  case CelValue::Type::kMessage:
+    out_message = value.MessageOrDie();
+    result->clear();
+    if (!out_message || out_message->SerializeToString(result)) {
       return WasmResult::Ok;
     }
     return WasmResult::SerializationFailure;
-  }
-  // Slow path using protobuf value conversion
   case CelValue::Type::kMap: {
-    ProtobufWkt::Value out;
-    if (!google::api::expr::runtime::ExportAsProtoValue(value, &out).ok()) {
-      return WasmResult::SerializationFailure;
+    const auto& map = *value.MapOrDie();
+    const auto& keys = *map.ListKeys();
+    std::vector<std::pair<std::string, std::string>> pairs(map.size(), std::make_pair("", ""));
+    for (auto i = 0; i < map.size(); i++) {
+      if (serializeValue(keys[i], &pairs[i].first) != WasmResult::Ok) {
+        return WasmResult::SerializationFailure;
+      }
+      if (serializeValue(map[keys[i]].value(), &pairs[i].second) != WasmResult::Ok) {
+        return WasmResult::SerializationFailure;
+      }
     }
-    if (!out.struct_value().SerializeToString(result)) {
-      return WasmResult::SerializationFailure;
-    }
+    auto size = proxy_wasm::exports::pairsSize(pairs);
+    // prevent string inlining which violates byte alignment
+    result->resize(std::max(size, static_cast<size_t>(30)));
+    proxy_wasm::exports::marshalPairs(pairs, result->data());
+    result->resize(size);
     return WasmResult::Ok;
   }
   case CelValue::Type::kList: {
-    ProtobufWkt::Value out;
-    if (!google::api::expr::runtime::ExportAsProtoValue(value, &out).ok()) {
-      return WasmResult::SerializationFailure;
+    const auto& list = *value.ListOrDie();
+    std::vector<std::pair<std::string, std::string>> pairs(list.size(), std::make_pair("", ""));
+    for (auto i = 0; i < list.size(); i++) {
+      if (serializeValue(list[i], &pairs[i].first) != WasmResult::Ok) {
+        return WasmResult::SerializationFailure;
+      }
     }
-    if (!out.list_value().SerializeToString(result)) {
-      return WasmResult::SerializationFailure;
+    auto size = proxy_wasm::exports::pairsSize(pairs);
+    // prevent string inlining which violates byte alignment
+    if (size < 30) {
+      result->reserve(30);
     }
+    result->resize(size);
+    proxy_wasm::exports::marshalPairs(pairs, result->data());
     return WasmResult::Ok;
   }
   default:
-    return WasmResult::SerializationFailure;
+    break;
   }
   return WasmResult::SerializationFailure;
 }
@@ -286,7 +403,7 @@ WasmResult serializeValue(Filters::Common::Expr::CelValue value, std::string* re
   _f(METADATA) _f(REQUEST) _f(RESPONSE) _f(CONNECTION) _f(UPSTREAM) _f(NODE) _f(SOURCE)            \
       _f(DESTINATION) _f(LISTENER_DIRECTION) _f(LISTENER_METADATA) _f(CLUSTER_NAME)                \
           _f(CLUSTER_METADATA) _f(ROUTE_NAME) _f(ROUTE_METADATA) _f(PLUGIN_NAME)                   \
-              _f(PLUGIN_ROOT_ID) _f(PLUGIN_VM_ID)
+              _f(PLUGIN_ROOT_ID) _f(PLUGIN_VM_ID) _f(CONNECTION_ID) _f(FILTER_STATE)
 
 static inline std::string downCase(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -299,7 +416,7 @@ enum class PropertyToken { PROPERTY_TOKENS(_DECLARE) };
 
 #define _PAIR(_t) {downCase(#_t), PropertyToken::_t},
 static absl::flat_hash_map<std::string, PropertyToken> property_tokens = {PROPERTY_TOKENS(_PAIR)};
-#undef _PARI
+#undef _PAIR
 
 absl::optional<google::api::expr::runtime::CelValue>
 Context::findValue(absl::string_view name, Protobuf::Arena* arena, bool last) const {
@@ -322,10 +439,7 @@ Context::findValue(absl::string_view name, Protobuf::Arena* arena, bool last) co
       } else {
         return {};
       }
-      if (last) {
-        return CelValue::CreateBytes(&state->value());
-      }
-      return state->exprValue(arena);
+      return state->exprValue(arena, last);
     }
     return {};
   }
@@ -339,13 +453,13 @@ Context::findValue(absl::string_view name, Protobuf::Arena* arena, bool last) co
   case PropertyToken::REQUEST:
     if (info) {
       return CelValue::CreateMap(Protobuf::Arena::Create<Filters::Common::Expr::RequestWrapper>(
-          arena, request_headers_ ? request_headers_ : access_log_request_headers_, *info));
+          arena, *arena, request_headers_ ? request_headers_ : access_log_request_headers_, *info));
     }
     break;
   case PropertyToken::RESPONSE:
     if (info) {
       return CelValue::CreateMap(Protobuf::Arena::Create<Filters::Common::Expr::ResponseWrapper>(
-          arena, response_headers_ ? response_headers_ : access_log_response_headers_,
+          arena, *arena, response_headers_ ? response_headers_ : access_log_response_headers_,
           response_trailers_ ? response_trailers_ : access_log_response_trailers_, *info));
     }
     break;
@@ -355,6 +469,13 @@ Context::findValue(absl::string_view name, Protobuf::Arena* arena, bool last) co
           Protobuf::Arena::Create<Filters::Common::Expr::ConnectionWrapper>(arena, *info));
     }
     break;
+  case PropertyToken::CONNECTION_ID: {
+    auto conn = getConnection();
+    if (conn) {
+      return CelValue::CreateUint64(conn->id());
+    }
+    break;
+  }
   case PropertyToken::UPSTREAM:
     if (info) {
       return CelValue::CreateMap(
@@ -424,6 +545,10 @@ Context::findValue(absl::string_view name, Protobuf::Arena* arena, bool last) co
     return CelValue::CreateStringView(root_id());
   case PropertyToken::PLUGIN_VM_ID:
     return CelValue::CreateStringView(wasm()->vm_id());
+  case PropertyToken::FILTER_STATE:
+    return Protobuf::Arena::Create<Filters::Common::Expr::FilterStateWrapper>(arena,
+                                                                              info->filterState())
+        ->Produce(arena);
   }
   return {};
 }
@@ -449,7 +574,7 @@ WasmResult Context::getProperty(absl::string_view path, std::string* result) {
     start = end + 1;
 
     if (first) {
-      // top-level ident
+      // top-level identifier
       first = false;
       auto top_value = findValue(part, &arena, start >= path.size());
       if (!top_value.has_value()) {
@@ -520,9 +645,6 @@ const Http::HeaderMap* Context::getConstMap(WasmHeaderMapType type) {
     }
     return request_headers_;
   case WasmHeaderMapType::RequestTrailers:
-    if (access_log_request_trailers_) {
-      return access_log_request_trailers_;
-    }
     return request_trailers_;
   case WasmHeaderMapType::ResponseHeaders:
     if (access_log_response_headers_) {
@@ -553,7 +675,7 @@ const Http::HeaderMap* Context::getConstMap(WasmHeaderMapType type) {
     return nullptr;
   }
   }
-  return nullptr;
+  NOT_REACHED_GCOVR_EXCL_LINE;
 }
 
 WasmResult Context::addHeaderMapValue(WasmHeaderMapType type, absl::string_view key,
@@ -576,7 +698,12 @@ WasmResult Context::getHeaderMapValue(WasmHeaderMapType type, absl::string_view 
   const Http::LowerCaseString lower_key{std::string(key)};
   auto entry = map->get(lower_key);
   if (!entry) {
-    return WasmResult::NotFound;
+    if (wasm()->abiVersion() == proxy_wasm::AbiVersion::ProxyWasm_0_1_0) {
+      *value = "";
+      return WasmResult::Ok;
+    } else {
+      return WasmResult::NotFound;
+    }
   }
   *value = entry->value().getStringView();
   return WasmResult::Ok;
@@ -588,14 +715,10 @@ Pairs headerMapToPairs(const Http::HeaderMap* map) {
   }
   Pairs pairs;
   pairs.reserve(map->size());
-  map->iterate(
-      [](const Http::HeaderEntry& header, void* pairs) -> Http::HeaderMap::Iterate {
-        (static_cast<Pairs*>(pairs))
-            ->push_back(
-                std::make_pair(header.key().getStringView(), header.value().getStringView()));
-        return Http::HeaderMap::Iterate::Continue;
-      },
-      &pairs);
+  map->iterate([&pairs](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+    pairs.push_back(std::make_pair(header.key().getStringView(), header.value().getStringView()));
+    return Http::HeaderMap::Iterate::Continue;
+  });
   return pairs;
 }
 
@@ -610,13 +733,10 @@ WasmResult Context::setHeaderMapPairs(WasmHeaderMapType type, const Pairs& pairs
     return WasmResult::BadArgument;
   }
   std::vector<std::string> keys;
-  map->iterate(
-      [](const Http::HeaderEntry& header, void* keys) -> Http::HeaderMap::Iterate {
-        (static_cast<std::vector<std::string>*>(keys))
-            ->push_back(std::string(header.key().getStringView()));
-        return Http::HeaderMap::Iterate::Continue;
-      },
-      &keys);
+  map->iterate([&keys](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+    keys.push_back(std::string(header.key().getStringView()));
+    return Http::HeaderMap::Iterate::Continue;
+  });
   for (auto& k : keys) {
     const Http::LowerCaseString lower_key{k};
     map->remove(lower_key);
@@ -661,6 +781,7 @@ WasmResult Context::getHeaderMapSize(WasmHeaderMapType type, uint32_t* result) {
 // Buffer
 
 BufferInterface* Context::getBuffer(WasmBufferType type) {
+  Envoy::Http::ResponseMessagePtr* response = nullptr;
   switch (type) {
   case WasmBufferType::CallData:
     // Set before the call.
@@ -671,7 +792,7 @@ BufferInterface* Context::getBuffer(WasmBufferType type) {
     if (plugin_) {
       return buffer_.set(plugin_->plugin_configuration_);
     }
-    break;
+    return nullptr;
   case WasmBufferType::HttpRequestBody:
     if (buffering_request_body_) {
       // We need the mutable version, so capture it using a callback.
@@ -695,25 +816,26 @@ BufferInterface* Context::getBuffer(WasmBufferType type) {
     return buffer_.set(network_downstream_data_buffer_);
   case WasmBufferType::NetworkUpstreamData:
     return buffer_.set(network_upstream_data_buffer_);
-  case WasmBufferType::HttpCallResponseBody: {
-    Envoy::Http::ResponseMessagePtr* response = rootContext()->http_call_response_;
+  case WasmBufferType::HttpCallResponseBody:
+    response = rootContext()->http_call_response_;
     if (response) {
-      return buffer_.set((*response)->body().get());
+      auto& body = (*response)->body();
+      return buffer_.set(absl::string_view(static_cast<const char*>(body.linearize(body.length())),
+                                           body.length()));
     }
-  } break;
+    return nullptr;
   case WasmBufferType::GrpcReceiveBuffer:
     return buffer_.set(rootContext()->grpc_receive_buffer_.get());
   default:
-    break;
+    return nullptr;
   }
-  return nullptr;
 }
 
 void Context::onDownstreamConnectionClose(CloseType close_type) {
   ContextBase::onDownstreamConnectionClose(close_type);
   downstream_closed_ = true;
-  // Call close on TCP connection, if upstream connection closed or there was a failure seen in this
-  // connection.
+  // Call close on TCP connection, if upstream connection closed or there was a failure seen in
+  // this connection.
   if (upstream_closed_ || getRequestStreamInfo()->hasAnyResponseFlag()) {
     onCloseTCP();
   }
@@ -725,6 +847,21 @@ void Context::onUpstreamConnectionClose(CloseType close_type) {
   if (downstream_closed_) {
     onCloseTCP();
   }
+}
+
+uint32_t Context::nextHttpCallToken() {
+  uint32_t token = next_http_call_token_++;
+  // Handle rollover.
+  for (;;) {
+    if (token == 0) {
+      token = next_http_call_token_++;
+    }
+    if (!http_request_.count(token)) {
+      break;
+    }
+    token = next_http_call_token_++;
+  }
+  return token;
 }
 
 // Async call via HTTP
@@ -749,8 +886,7 @@ WasmResult Context::httpCall(absl::string_view cluster, const Pairs& request_hea
   }
 
   if (!request_body.empty()) {
-    message->body() =
-        std::make_unique<::Envoy::Buffer::OwnedImpl>(request_body.data(), request_body.size());
+    message->body().add(request_body);
     message->headers().setContentLength(request_body.size());
   }
 
@@ -763,17 +899,7 @@ WasmResult Context::httpCall(absl::string_view cluster, const Pairs& request_hea
     timeout = std::chrono::milliseconds(timeout_milliseconds);
   }
 
-  auto token = next_http_call_token_++;
-  // Handle rollover.
-  for (;;) {
-    if (token == 0) {
-      token = next_http_call_token_++;
-    }
-    if (!http_request_.count(token)) {
-      break;
-    }
-    token = next_http_call_token_++;
-  }
+  uint32_t token = nextHttpCallToken();
   auto& handler = http_request_[token];
 
   // set default hash policy to be based on :authority to enable consistent hash
@@ -796,6 +922,22 @@ WasmResult Context::httpCall(absl::string_view cluster, const Pairs& request_hea
   return WasmResult::Ok;
 }
 
+uint32_t Context::nextGrpcCallToken() {
+  uint32_t token = next_grpc_token_++;
+  if (isGrpcStreamToken(token)) {
+    token = next_grpc_token_++;
+  }
+  // Handle rollover. Note: token is always odd.
+  for (;;) {
+    if (!grpc_call_request_.count(token)) {
+      break;
+    }
+    next_grpc_token_++; // Skip stream token.
+    token = next_grpc_token_++;
+  }
+  return token;
+}
+
 WasmResult Context::grpcCall(absl::string_view grpc_service, absl::string_view service_name,
                              absl::string_view method_name, const Pairs& initial_metadata,
                              absl::string_view request, std::chrono::milliseconds timeout,
@@ -804,20 +946,7 @@ WasmResult Context::grpcCall(absl::string_view grpc_service, absl::string_view s
   if (!service_proto.ParseFromArray(grpc_service.data(), grpc_service.size())) {
     return WasmResult::ParseFailure;
   }
-  auto token = next_grpc_token_++;
-  if (IsGrpcStreamToken(token)) {
-    token = next_grpc_token_++;
-  }
-  // Handle rollover.
-  for (;;) {
-    if (token == 0) {
-      token = next_grpc_token_ += 2;
-    }
-    if (!grpc_call_request_.count(token)) {
-      break;
-    }
-    token = next_grpc_token_ += 2;
-  }
+  uint32_t token = nextGrpcCallToken();
   auto& handler = grpc_call_request_[token];
   handler.context_ = this;
   handler.token_ = token;
@@ -848,6 +977,26 @@ WasmResult Context::grpcCall(absl::string_view grpc_service, absl::string_view s
   return WasmResult::Ok;
 }
 
+uint32_t Context::nextGrpcStreamToken() {
+  uint32_t token = next_grpc_token_++;
+  if (isGrpcCallToken(token)) {
+    token = next_grpc_token_++;
+  }
+  // Handle rollover. Note: token is always even.
+  for (;;) {
+    if (token == 0) {
+      next_grpc_token_++; // Skip call token.
+      token = next_grpc_token_++;
+    }
+    if (!grpc_stream_.count(token)) {
+      break;
+    }
+    next_grpc_token_++; // Skip call token.
+    token = next_grpc_token_++;
+  }
+  return token;
+}
+
 WasmResult Context::grpcStream(absl::string_view grpc_service, absl::string_view service_name,
                                absl::string_view method_name, const Pairs& initial_metadata,
                                uint32_t* token_ptr) {
@@ -855,20 +1004,7 @@ WasmResult Context::grpcStream(absl::string_view grpc_service, absl::string_view
   if (!service_proto.ParseFromArray(grpc_service.data(), grpc_service.size())) {
     return WasmResult::ParseFailure;
   }
-  auto token = next_grpc_token_++;
-  if (IsGrpcCallToken(token)) {
-    token = next_grpc_token_++;
-  }
-  // Handle rollover.
-  for (;;) {
-    if (token == 0) {
-      token = next_grpc_token_ += 2;
-    }
-    if (!grpc_stream_.count(token)) {
-      break;
-    }
-    token = next_grpc_token_ += 2;
-  }
+  uint32_t token = nextGrpcStreamToken();
   auto& handler = grpc_stream_[token];
   handler.context_ = this;
   handler.token_ = token;
@@ -962,7 +1098,7 @@ WasmResult Context::setProperty(absl::string_view path, absl::string_view value)
     const auto& it = rootContext()->state_prototypes_.find(path);
     const WasmStatePrototype& prototype = it == rootContext()->state_prototypes_.end()
                                               ? DefaultWasmStatePrototype::get()
-                                              : *it->second.get();
+                                              : *it->second.get(); // NOLINT
     auto state_ptr = std::make_unique<WasmState>(prototype);
     state = state_ptr.get();
     stream_info->filterState()->setData(key, std::move(state_ptr),
@@ -1005,10 +1141,15 @@ WasmResult Context::log(uint32_t level, absl::string_view message) {
   case spdlog::level::critical:
     ENVOY_LOG(critical, "wasm log{}: {}", log_prefix(), message);
     return WasmResult::Ok;
-  case spdlog::level::off:
-    return WasmResult::Ok;
+  default:
+    NOT_REACHED_GCOVR_EXCL_LINE;
   }
-  NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
+}
+
+uint32_t Context::getLogLevel() {
+  // Like the "log" call above, assume that spdlog level as an int
+  // matches the enum in the SDK
+  return static_cast<uint32_t>(ENVOY_LOGGER().level());
 }
 
 //
@@ -1020,18 +1161,22 @@ bool Context::validateConfiguration(absl::string_view configuration,
   if (!wasm()->validate_configuration_) {
     return true;
   }
-  configuration_ = configuration;
   plugin_ = plugin_base;
   auto result =
       wasm()
           ->validate_configuration_(this, id_, static_cast<uint32_t>(configuration.size()))
           .u64_ != 0;
   plugin_.reset();
-  configuration_ = "";
   return result;
 }
 
-absl::string_view Context::getConfiguration() { return configuration_; }
+absl::string_view Context::getConfiguration() {
+  if (plugin_) {
+    return plugin_->plugin_configuration_;
+  } else {
+    return wasm()->vm_configuration();
+  }
+};
 
 std::pair<uint32_t, absl::string_view> Context::getStatus() {
   return std::make_pair(status_code_, status_message_);
@@ -1049,7 +1194,12 @@ void Context::onGrpcReceiveTrailingMetadataWrapper(uint32_t token, Http::HeaderM
   grpc_receive_trailing_metadata_ = nullptr;
 }
 
-WasmResult Context::defineMetric(MetricType type, absl::string_view name, uint32_t* metric_id_ptr) {
+WasmResult Context::defineMetric(uint32_t metric_type, absl::string_view name,
+                                 uint32_t* metric_id_ptr) {
+  if (metric_type > static_cast<uint32_t>(MetricType::Max)) {
+    return WasmResult::BadArgument;
+  }
+  auto type = static_cast<MetricType>(metric_type);
   // TODO: Consider rethinking the scoping policy as it does not help in this case.
   Stats::StatNameManagedStorage storage(name, wasm()->scope_->symbolTable());
   Stats::StatName stat_name = storage.statName();
@@ -1059,20 +1209,20 @@ WasmResult Context::defineMetric(MetricType type, absl::string_view name, uint32
     wasm()->counters_.emplace(id, c);
     *metric_id_ptr = id;
     return WasmResult::Ok;
-  } else if (type == MetricType::Gauge) {
+  }
+  if (type == MetricType::Gauge) {
     auto id = wasm()->nextGaugeMetricId();
     auto g = &wasm()->scope_->gaugeFromStatName(stat_name, Stats::Gauge::ImportMode::Accumulate);
     wasm()->gauges_.emplace(id, g);
     *metric_id_ptr = id;
     return WasmResult::Ok;
-  } else if (type == MetricType::Histogram) {
-    auto id = wasm()->nextHistogramMetricId();
-    auto h = &wasm()->scope_->histogramFromStatName(stat_name, Stats::Histogram::Unit::Unspecified);
-    wasm()->histograms_.emplace(id, h);
-    *metric_id_ptr = id;
-    return WasmResult::Ok;
   }
-  return WasmResult::BadArgument;
+  // (type == MetricType::Histogram) {
+  auto id = wasm()->nextHistogramMetricId();
+  auto h = &wasm()->scope_->histogramFromStatName(stat_name, Stats::Histogram::Unit::Unspecified);
+  wasm()->histograms_.emplace(id, h);
+  *metric_id_ptr = id;
+  return WasmResult::Ok;
 }
 
 WasmResult Context::incrementMetric(uint32_t metric_id, int64_t offset) {
@@ -1086,8 +1236,8 @@ WasmResult Context::incrementMetric(uint32_t metric_id, int64_t offset) {
       } else {
         return WasmResult::BadArgument;
       }
-      return WasmResult::NotFound;
     }
+    return WasmResult::NotFound;
   } else if (type == MetricType::Gauge) {
     auto it = wasm()->gauges_.find(metric_id);
     if (it != wasm()->gauges_.end()) {
@@ -1163,50 +1313,49 @@ Context::~Context() {
 
 Network::FilterStatus convertNetworkFilterStatus(proxy_wasm::FilterStatus status) {
   switch (status) {
+  default:
   case proxy_wasm::FilterStatus::Continue:
     return Network::FilterStatus::Continue;
   case proxy_wasm::FilterStatus::StopIteration:
     return Network::FilterStatus::StopIteration;
   }
-  NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
 };
 
 Http::FilterHeadersStatus convertFilterHeadersStatus(proxy_wasm::FilterHeadersStatus status) {
   switch (status) {
+  default:
   case proxy_wasm::FilterHeadersStatus::Continue:
     return Http::FilterHeadersStatus::Continue;
   case proxy_wasm::FilterHeadersStatus::StopIteration:
     return Http::FilterHeadersStatus::StopIteration;
-  case proxy_wasm::FilterHeadersStatus::ContinueAndEndStream:
-    return Http::FilterHeadersStatus::ContinueAndEndStream;
   case proxy_wasm::FilterHeadersStatus::StopAllIterationAndBuffer:
     return Http::FilterHeadersStatus::StopAllIterationAndBuffer;
   case proxy_wasm::FilterHeadersStatus::StopAllIterationAndWatermark:
     return Http::FilterHeadersStatus::StopAllIterationAndWatermark;
   }
-  NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
 };
 
 Http::FilterTrailersStatus convertFilterTrailersStatus(proxy_wasm::FilterTrailersStatus status) {
   switch (status) {
+  default:
   case proxy_wasm::FilterTrailersStatus::Continue:
     return Http::FilterTrailersStatus::Continue;
   case proxy_wasm::FilterTrailersStatus::StopIteration:
     return Http::FilterTrailersStatus::StopIteration;
   }
-  NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
 };
 
 Http::FilterMetadataStatus convertFilterMetadataStatus(proxy_wasm::FilterMetadataStatus status) {
   switch (status) {
+  default:
   case proxy_wasm::FilterMetadataStatus::Continue:
     return Http::FilterMetadataStatus::Continue;
   }
-  NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
 };
 
 Http::FilterDataStatus convertFilterDataStatus(proxy_wasm::FilterDataStatus status) {
   switch (status) {
+  default:
   case proxy_wasm::FilterDataStatus::Continue:
     return Http::FilterDataStatus::Continue;
   case proxy_wasm::FilterDataStatus::StopIterationAndBuffer:
@@ -1216,7 +1365,6 @@ Http::FilterDataStatus convertFilterDataStatus(proxy_wasm::FilterDataStatus stat
   case proxy_wasm::FilterDataStatus::StopIterationNoBuffer:
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
-  NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
 };
 
 Network::FilterStatus Context::onNewConnection() {
@@ -1284,9 +1432,15 @@ void Context::log(const Http::RequestHeaderMap* request_headers,
                   const Http::ResponseHeaderMap* response_headers,
                   const Http::ResponseTrailerMap* response_trailers,
                   const StreamInfo::StreamInfo& stream_info) {
-  if (!http_request_started_) {
-    return;
+  if (!in_vm_context_created_) {
+    // If the request is invalid then onRequestHeaders() will not be called and neither will
+    // onCreate() in cases like sendLocalReply who short-circuits envoy
+    // lifecycle. This is because Envoy does not have a well defined lifetime for the combined
+    // HTTP
+    // + AccessLog filter. Thus, to log these scenarios, we call onCreate() in log function below.
+    onCreate();
   }
+
   access_log_request_headers_ = request_headers;
   // ? request_trailers  ?
   access_log_response_headers_ = response_headers;
@@ -1300,8 +1454,6 @@ void Context::log(const Http::RequestHeaderMap* request_headers,
   access_log_response_headers_ = nullptr;
   access_log_response_trailers_ = nullptr;
   access_log_stream_info_ = nullptr;
-
-  onDelete();
 }
 
 void Context::onDestroy() {
@@ -1310,6 +1462,7 @@ void Context::onDestroy() {
   }
   destroyed_ = true;
   onDone();
+  onDelete();
 }
 
 WasmResult Context::continueStream(WasmStreamType stream_type) {
@@ -1338,11 +1491,17 @@ WasmResult Context::closeStream(WasmStreamType stream_type) {
   switch (stream_type) {
   case WasmStreamType::Request:
     if (decoder_callbacks_) {
+      if (!decoder_callbacks_->streamInfo().responseCodeDetails().has_value()) {
+        decoder_callbacks_->streamInfo().setResponseCodeDetails(FailStreamResponseDetails);
+      }
       decoder_callbacks_->resetStream();
     }
     return WasmResult::Ok;
   case WasmStreamType::Response:
     if (encoder_callbacks_) {
+      if (!encoder_callbacks_->streamInfo().responseCodeDetails().has_value()) {
+        encoder_callbacks_->streamInfo().setResponseCodeDetails(FailStreamResponseDetails);
+      }
       encoder_callbacks_->resetStream();
     }
     return WasmResult::Ok;
@@ -1363,16 +1522,32 @@ WasmResult Context::closeStream(WasmStreamType stream_type) {
 WasmResult Context::sendLocalResponse(uint32_t response_code, absl::string_view body_text,
                                       Pairs additional_headers, uint32_t grpc_status,
                                       absl::string_view details) {
+  // "additional_headers" is a collection of string_views. These will no longer
+  // be valid when "modify_headers" is finally called below, so we must
+  // make copies of all the headers.
+  std::vector<std::pair<Http::LowerCaseString, std::string>> additional_headers_copy;
+  for (auto& p : additional_headers) {
+    const Http::LowerCaseString lower_key{std::string(p.first)};
+    additional_headers_copy.emplace_back(lower_key, std::string(p.second));
+  }
 
-  auto modify_headers = [additional_headers](Http::HeaderMap& headers) {
-    for (auto& p : additional_headers) {
-      const Http::LowerCaseString lower_key{std::string(p.first)};
-      headers.addCopy(lower_key, std::string(p.second));
+  auto modify_headers = [additional_headers_copy](Http::HeaderMap& headers) {
+    for (auto& p : additional_headers_copy) {
+      headers.addCopy(p.first, p.second);
     }
   };
+
   if (decoder_callbacks_) {
-    decoder_callbacks_->sendLocalReply(static_cast<Envoy::Http::Code>(response_code), body_text,
-                                       modify_headers, grpc_status, details);
+    // This is a bit subtle because proxy_on_delete() does call DeferAfterCallActions(),
+    // so in theory it could call this and the Context in the VM would be invalid,
+    // but because it only gets called after the connections have drained, the call to
+    // sendLocalReply() will fail. Net net, this is safe.
+    wasm()->addAfterVmCallAction([this, response_code, body_text = std::string(body_text),
+                                  modify_headers = std::move(modify_headers), grpc_status,
+                                  details = std::string(details)] {
+      decoder_callbacks_->sendLocalReply(static_cast<Envoy::Http::Code>(response_code), body_text,
+                                         modify_headers, grpc_status, details);
+    });
   }
   return WasmResult::Ok;
 }
@@ -1395,7 +1570,9 @@ Http::FilterDataStatus Context::decodeData(::Envoy::Buffer::Instance& data, bool
   }
   request_body_buffer_ = &data;
   end_of_stream_ = end_stream;
-  auto result = convertFilterDataStatus(onRequestBody(data.length(), end_stream));
+  const auto buffer = getBuffer(WasmBufferType::HttpRequestBody);
+  const auto buffer_size = (buffer == nullptr) ? 0 : buffer->size();
+  auto result = convertFilterDataStatus(onRequestBody(buffer_size, end_stream));
   buffering_request_body_ = false;
   switch (result) {
   case Http::FilterDataStatus::Continue:
@@ -1463,7 +1640,9 @@ Http::FilterDataStatus Context::encodeData(::Envoy::Buffer::Instance& data, bool
   }
   response_body_buffer_ = &data;
   end_of_stream_ = end_stream;
-  auto result = convertFilterDataStatus(onResponseBody(data.length(), end_stream));
+  const auto buffer = getBuffer(WasmBufferType::HttpResponseBody);
+  const auto buffer_size = (buffer == nullptr) ? 0 : buffer->size();
+  auto result = convertFilterDataStatus(onResponseBody(buffer_size, end_stream));
   buffering_response_body_ = false;
   switch (result) {
   case Http::FilterDataStatus::Continue:
@@ -1519,7 +1698,7 @@ void Context::onHttpCallSuccess(uint32_t token, Envoy::Http::ResponseMessagePtr&
     return;
   }
   http_call_response_ = &response;
-  uint32_t body_size = response->body() ? response->body()->length() : 0;
+  uint32_t body_size = response->body().length();
   onHttpCallResponse(token, response->headers().size(), body_size,
                      headerSize(response->trailers()));
   http_call_response_ = nullptr;
@@ -1549,7 +1728,7 @@ void Context::onGrpcReceiveWrapper(uint32_t token, ::Envoy::Buffer::InstancePtr 
     ContextBase::onGrpcReceive(token, response_size);
     grpc_receive_buffer_.reset();
   }
-  if (IsGrpcCallToken(token)) {
+  if (isGrpcCallToken(token)) {
     grpc_call_request_.erase(token);
   }
 }
@@ -1569,22 +1748,27 @@ void Context::onGrpcCloseWrapper(uint32_t token, const Grpc::Status::GrpcStatus&
     onGrpcClose(token, status_code_);
     status_message_ = "";
   }
-  if (IsGrpcCallToken(token)) {
+  if (isGrpcCallToken(token)) {
     grpc_call_request_.erase(token);
   } else {
-    grpc_stream_.erase(token);
+    auto it = grpc_stream_.find(token);
+    if (it != grpc_stream_.end()) {
+      if (it->second.local_closed_) {
+        grpc_stream_.erase(token);
+      }
+    }
   }
 }
 
 WasmResult Context::grpcSend(uint32_t token, absl::string_view message, bool end_stream) {
-  if (IsGrpcCallToken(token)) {
+  if (isGrpcCallToken(token)) {
     return WasmResult::BadArgument;
   }
   auto it = grpc_stream_.find(token);
   if (it == grpc_stream_.end()) {
     return WasmResult::NotFound;
   }
-  if (it != grpc_stream_.end() && it->second.stream_) {
+  if (it->second.stream_) {
     it->second.stream_->sendMessageRaw(::Envoy::Buffer::InstancePtr(new ::Envoy::Buffer::OwnedImpl(
                                            message.data(), message.size())),
                                        end_stream);
@@ -1593,12 +1777,12 @@ WasmResult Context::grpcSend(uint32_t token, absl::string_view message, bool end
 }
 
 WasmResult Context::grpcClose(uint32_t token) {
-  if (IsGrpcCallToken(token)) {
+  if (isGrpcCallToken(token)) {
     auto it = grpc_call_request_.find(token);
     if (it == grpc_call_request_.end()) {
       return WasmResult::NotFound;
     }
-    if (it != grpc_call_request_.end() && it->second.request_) {
+    if (it->second.request_) {
       it->second.request_->cancel();
     }
     grpc_call_request_.erase(token);
@@ -1607,21 +1791,25 @@ WasmResult Context::grpcClose(uint32_t token) {
     if (it == grpc_stream_.end()) {
       return WasmResult::NotFound;
     }
-    if (it != grpc_stream_.end() && it->second.stream_) {
+    if (it->second.stream_) {
       it->second.stream_->closeStream();
     }
-    grpc_stream_.erase(token);
+    if (it->second.remote_closed_) {
+      grpc_stream_.erase(token);
+    } else {
+      it->second.local_closed_ = true;
+    }
   }
   return WasmResult::Ok;
 }
 
 WasmResult Context::grpcCancel(uint32_t token) {
-  if (IsGrpcCallToken(token)) {
+  if (isGrpcCallToken(token)) {
     auto it = grpc_call_request_.find(token);
     if (it == grpc_call_request_.end()) {
       return WasmResult::NotFound;
     }
-    if (it != grpc_call_request_.end() && it->second.request_) {
+    if (it->second.request_) {
       it->second.request_->cancel();
     }
     grpc_call_request_.erase(token);
@@ -1630,7 +1818,7 @@ WasmResult Context::grpcCancel(uint32_t token) {
     if (it == grpc_stream_.end()) {
       return WasmResult::NotFound;
     }
-    if (it != grpc_stream_.end() && it->second.stream_) {
+    if (it->second.stream_) {
       it->second.stream_->resetStream();
     }
     grpc_stream_.erase(token);

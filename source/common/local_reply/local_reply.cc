@@ -9,6 +9,7 @@
 #include "common/formatter/substitution_format_string.h"
 #include "common/formatter/substitution_formatter.h"
 #include "common/http/header_map_impl.h"
+#include "common/router/header_parser.h"
 
 namespace Envoy {
 namespace LocalReply {
@@ -22,10 +23,12 @@ public:
   BodyFormatter(const envoy::config::core::v3::SubstitutionFormatString& config)
       : formatter_(Formatter::SubstitutionFormatStringUtils::fromProtoConfig(config)),
         content_type_(
-            config.format_case() ==
-                    envoy::config::core::v3::SubstitutionFormatString::FormatCase::kJsonFormat
-                ? Http::Headers::get().ContentTypeValues.Json
-                : Http::Headers::get().ContentTypeValues.Text) {}
+            !config.content_type().empty()
+                ? config.content_type()
+                : config.format_case() ==
+                          envoy::config::core::v3::SubstitutionFormatString::FormatCase::kJsonFormat
+                      ? Http::Headers::get().ContentTypeValues.Json
+                      : Http::Headers::get().ContentTypeValues.Text) {}
 
   void format(const Http::RequestHeaderMap& request_headers,
               const Http::ResponseHeaderMap& response_headers,
@@ -39,10 +42,11 @@ public:
 
 private:
   const Formatter::FormatterPtr formatter_;
-  const absl::string_view content_type_;
+  const std::string content_type_;
 };
 
 using BodyFormatterPtr = std::unique_ptr<BodyFormatter>;
+using HeaderParserPtr = std::unique_ptr<Envoy::Router::HeaderParser>;
 
 class ResponseMapper {
 public:
@@ -51,7 +55,7 @@ public:
           config,
       Server::Configuration::FactoryContext& context)
       : filter_(AccessLog::FilterFactory::fromProto(config.filter(), context.runtime(),
-                                                    context.random(),
+                                                    context.api().randomGenerator(),
                                                     context.messageValidationVisitor())) {
     if (config.has_status_code()) {
       status_code_ = static_cast<Http::Code>(config.status_code().value());
@@ -63,6 +67,8 @@ public:
     if (config.has_body_format_override()) {
       body_formatter_ = std::make_unique<BodyFormatter>(config.body_format_override());
     }
+
+    header_parser_ = Envoy::Router::HeaderParser::configure(config.headers_to_add());
   }
 
   bool matchAndRewrite(const Http::RequestHeaderMap& request_headers,
@@ -78,6 +84,8 @@ public:
     if (body_.has_value()) {
       body = body_.value();
     }
+
+    header_parser_->evaluateHeaders(response_headers, stream_info);
 
     if (status_code_.has_value() && code != status_code_.value()) {
       code = status_code_.value();
@@ -95,6 +103,7 @@ private:
   const AccessLog::FilterPtr filter_;
   absl::optional<Http::Code> status_code_;
   absl::optional<std::string> body_;
+  HeaderParserPtr header_parser_;
   BodyFormatterPtr body_formatter_;
 };
 

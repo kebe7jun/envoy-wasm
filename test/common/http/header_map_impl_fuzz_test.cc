@@ -7,6 +7,7 @@
 #include "test/common/http/header_map_impl_fuzz.pb.h"
 #include "test/fuzz/fuzz_runner.h"
 #include "test/fuzz/utility.h"
+#include "test/test_common/test_runtime.h"
 
 #include "absl/strings/ascii.h"
 
@@ -16,6 +17,14 @@ namespace Envoy {
 
 // Fuzz the header map implementation.
 DEFINE_PROTO_FUZZER(const test::common::http::HeaderMapImplFuzzTestCase& input) {
+  TestScopedRuntime runtime;
+  // Set the lazy header-map threshold if found.
+  if (input.has_config()) {
+    Runtime::LoaderSingleton::getExisting()->mergeValues(
+        {{"envoy.http.headermap.lazy_map_min_size",
+          absl::StrCat(input.config().lazy_map_min_size())}});
+  }
+
   auto header_map = Http::RequestHeaderMapImpl::create();
   std::vector<std::unique_ptr<Http::LowerCaseString>> lower_case_strings;
   std::vector<std::unique_ptr<std::string>> strings;
@@ -152,12 +161,6 @@ DEFINE_PROTO_FUZZER(const test::common::http::HeaderMapImplFuzzTestCase& input) 
       header_map = Http::createHeaderMap<Http::RequestHeaderMapImpl>(*header_map);
       break;
     }
-    case test::common::http::Action::kLookup: {
-      const Http::HeaderEntry* header_entry;
-      header_map->lookup(Http::LowerCaseString(replaceInvalidCharacters(action.lookup())),
-                         &header_entry);
-      break;
-    }
     case test::common::http::Action::kRemove: {
       header_map->remove(Http::LowerCaseString(replaceInvalidCharacters(action.remove())));
       break;
@@ -178,20 +181,16 @@ DEFINE_PROTO_FUZZER(const test::common::http::HeaderMapImplFuzzTestCase& input) 
     // Exercise some read-only accessors.
     header_map->size();
     header_map->byteSize();
-    header_map->iterate(
-        [](const Http::HeaderEntry& header, void * /*context*/) -> Http::HeaderMap::Iterate {
-          header.key();
-          header.value();
-          return Http::HeaderMap::Iterate::Continue;
-        },
-        nullptr);
-    header_map->iterateReverse(
-        [](const Http::HeaderEntry& header, void * /*context*/) -> Http::HeaderMap::Iterate {
-          header.key();
-          header.value();
-          return Http::HeaderMap::Iterate::Continue;
-        },
-        nullptr);
+    header_map->iterate([](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+      header.key();
+      header.value();
+      return Http::HeaderMap::Iterate::Continue;
+    });
+    header_map->iterateReverse([](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+      header.key();
+      header.value();
+      return Http::HeaderMap::Iterate::Continue;
+    });
   }
 }
 

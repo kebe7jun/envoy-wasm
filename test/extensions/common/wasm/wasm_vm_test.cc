@@ -11,12 +11,12 @@
 #include "gtest/gtest.h"
 #include "include/proxy-wasm/null_vm_plugin.h"
 
-using proxy_wasm::Cloneable;
-using proxy_wasm::WasmCallVoid;
-using proxy_wasm::WasmCallWord;
-using proxy_wasm::Word;
-using testing::HasSubstr;
-using testing::Return;
+using proxy_wasm::Cloneable;    // NOLINT
+using proxy_wasm::WasmCallVoid; // NOLINT
+using proxy_wasm::WasmCallWord; // NOLINT
+using proxy_wasm::Word;         // NOLINT
+using testing::HasSubstr;       // NOLINT
+using testing::Return;          // NOLINT
 
 namespace Envoy {
 namespace Extensions {
@@ -63,6 +63,10 @@ TEST_F(BaseVmTest, NullVmStartup) {
   auto wasm_vm_clone = wasm_vm->clone();
   EXPECT_TRUE(wasm_vm_clone != nullptr);
   EXPECT_TRUE(wasm_vm->getCustomSection("user").empty());
+  EXPECT_EQ(getEnvoyWasmIntegration(*wasm_vm).runtime(), "envoy.wasm.runtime.null");
+  std::function<void()> f;
+  EXPECT_FALSE(
+      getEnvoyWasmIntegration(*wasm_vm).getNullVmFunction("bad_function", false, 0, nullptr, &f));
 }
 
 TEST_F(BaseVmTest, NullVmMemory) {
@@ -100,6 +104,7 @@ public:
   MOCK_METHOD(uint32_t, random, (), (const));
 };
 
+#if defined(ENVOY_WASM_V8)
 MockHostFunctions* g_host_functions;
 
 void pong(void*, Word value) { g_host_functions->pong(convertWordToUint32(value)); }
@@ -119,7 +124,9 @@ class WasmVmTest : public testing::TestWithParam<bool> {
 public:
   WasmVmTest() : scope_(Stats::ScopeSharedPtr(stats_store.createScope("wasm."))) {}
 
-  void SetUp() override { g_host_functions = new MockHostFunctions(); }
+  void SetUp() override { // NOLINT(readability-identifier-naming)
+    g_host_functions = new MockHostFunctions();
+  }
   void TearDown() override { delete g_host_functions; }
 
 protected:
@@ -137,6 +144,13 @@ TEST_P(WasmVmTest, V8BadCode) {
 }
 
 TEST_P(WasmVmTest, V8Code) {
+#ifndef NDEBUG
+  // Do not execute pre-compilation tests in debug mode because V8 will fail to load because the
+  // flags do not match. TODO: restore this test when the rust toolchain is integrated.
+  if (GetParam() == 1) {
+    return;
+  }
+#endif
   auto wasm_vm = createWasmVm("envoy.wasm.runtime.v8", scope_);
   ASSERT_TRUE(wasm_vm != nullptr);
   EXPECT_TRUE(wasm_vm->runtime() == "v8");
@@ -157,6 +171,13 @@ TEST_P(WasmVmTest, V8Code) {
 }
 
 TEST_P(WasmVmTest, V8BadHostFunctions) {
+#ifndef NDEBUG
+  // Do not execute pre-compilation tests in debug mode because V8 will fail to load because the
+  // flags do not match. TODO: restore this test when the rust toolchain is integrated.
+  if (GetParam() == 1) {
+    return;
+  }
+#endif
   auto wasm_vm = createWasmVm("envoy.wasm.runtime.v8", scope_);
   ASSERT_TRUE(wasm_vm != nullptr);
 
@@ -178,6 +199,13 @@ TEST_P(WasmVmTest, V8BadHostFunctions) {
 }
 
 TEST_P(WasmVmTest, V8BadModuleFunctions) {
+#ifndef NDEBUG
+  // Do not execute pre-compilation tests in debug mode because V8 will fail to load because the
+  // flags do not match. TODO: restore this test when the rust toolchain is integrated.
+  if (GetParam() == 1) {
+    return;
+  }
+#endif
   auto wasm_vm = createWasmVm("envoy.wasm.runtime.v8", scope_);
   ASSERT_TRUE(wasm_vm != nullptr);
 
@@ -206,6 +234,13 @@ TEST_P(WasmVmTest, V8BadModuleFunctions) {
 }
 
 TEST_P(WasmVmTest, V8FunctionCalls) {
+#ifndef NDEBUG
+  // Do not execute pre-compilation tests in debug mode because V8 will fail to load because the
+  // flags do not match. TODO: restore this test when the rust toolchain is integrated.
+  if (GetParam() == 1) {
+    return;
+  }
+#endif
   auto wasm_vm = createWasmVm("envoy.wasm.runtime.v8", scope_);
   ASSERT_TRUE(wasm_vm != nullptr);
 
@@ -244,6 +279,13 @@ TEST_P(WasmVmTest, V8FunctionCalls) {
 }
 
 TEST_P(WasmVmTest, V8Memory) {
+#ifndef NDEBUG
+  // Do not execute pre-compilation tests in debug mode because V8 will fail to load because the
+  // flags do not match. TODO: restore this test when the rust toolchain is integrated.
+  if (GetParam() == 1) {
+    return;
+  }
+#endif
   auto wasm_vm = createWasmVm("envoy.wasm.runtime.v8", scope_);
   ASSERT_TRUE(wasm_vm != nullptr);
 
@@ -276,6 +318,7 @@ TEST_P(WasmVmTest, V8Memory) {
   EXPECT_FALSE(wasm_vm->setWord(1024 * 1024 /* out of bound */, 1));
   EXPECT_FALSE(wasm_vm->getWord(1024 * 1024 /* out of bound */, &word));
 }
+#endif
 
 } // namespace
 } // namespace Wasm

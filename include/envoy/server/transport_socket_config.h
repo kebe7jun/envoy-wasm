@@ -2,12 +2,12 @@
 
 #include <string>
 
+#include "envoy/config/core/v3/health_check.pb.h"
 #include "envoy/config/typed_config.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/init/manager.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/network/transport_socket.h"
-#include "envoy/runtime/runtime.h"
 #include "envoy/secret/secret_manager.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/singleton/manager.h"
@@ -63,11 +63,6 @@ public:
    * @return Event::Dispatcher& the main thread's dispatcher.
    */
   virtual Event::Dispatcher& dispatcher() PURE;
-
-  /**
-   * @return RandomGenerator& the random generator for the server.
-   */
-  virtual Envoy::Runtime::RandomGenerator& random() PURE;
 
   /**
    * @return the server-wide stats store.

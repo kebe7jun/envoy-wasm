@@ -154,28 +154,31 @@ class RawHttpClientImpl : public Client,
                           public Http::AsyncClient::Callbacks,
                           Logger::Loggable<Logger::Id::config> {
 public:
-  explicit RawHttpClientImpl(Upstream::ClusterManager& cm, ClientConfigSharedPtr config,
-                             TimeSource& time_source);
+  explicit RawHttpClientImpl(Upstream::ClusterManager& cm, ClientConfigSharedPtr config);
   ~RawHttpClientImpl() override;
 
   // ExtAuthz::Client
   void cancel() override;
-  void check(RequestCallbacks& callbacks, const envoy::service::auth::v3::CheckRequest& request,
-             Tracing::Span& parent_span, const StreamInfo::StreamInfo& stream_info) override;
+  void check(RequestCallbacks& callbacks, Event::Dispatcher& dispatcher,
+             const envoy::service::auth::v3::CheckRequest& request, Tracing::Span& parent_span,
+             const StreamInfo::StreamInfo& stream_info) override;
 
   // Http::AsyncClient::Callbacks
   void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&& message) override;
   void onFailure(const Http::AsyncClient::Request&,
                  Http::AsyncClient::FailureReason reason) override;
+  void onBeforeFinalizeUpstreamSpan(Tracing::Span& span,
+                                    const Http::ResponseHeaderMap* response_headers) override;
 
 private:
+  void onTimeout();
   ResponsePtr toResponse(Http::ResponseMessagePtr message);
+
   Upstream::ClusterManager& cm_;
   ClientConfigSharedPtr config_;
   Http::AsyncClient::Request* request_{};
   RequestCallbacks* callbacks_{};
-  TimeSource& time_source_;
-  Tracing::SpanPtr span_;
+  Event::TimerPtr timeout_timer_;
 };
 
 } // namespace ExtAuthz

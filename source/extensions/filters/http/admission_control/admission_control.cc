@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "envoy/common/random_generator.h"
 #include "envoy/extensions/filters/http/admission_control/v3alpha/admission_control.pb.h"
 #include "envoy/grpc/status.h"
 #include "envoy/http/codes.h"
@@ -28,22 +29,30 @@ namespace AdmissionControl {
 
 using GrpcStatus = Grpc::Status::GrpcStatus;
 
-static constexpr double defaultAggression = 2.0;
+static constexpr double defaultAggression = 1.0;
+static constexpr double defaultSuccessRateThreshold = 95.0;
 
 AdmissionControlFilterConfig::AdmissionControlFilterConfig(
-    const AdmissionControlProto& proto_config, Runtime::Loader& runtime, TimeSource&,
-    Runtime::RandomGenerator& random, Stats::Scope& scope, ThreadLocal::SlotPtr&& tls,
+    const AdmissionControlProto& proto_config, Runtime::Loader& runtime,
+    Random::RandomGenerator& random, Stats::Scope& scope, ThreadLocal::SlotPtr&& tls,
     std::shared_ptr<ResponseEvaluator> response_evaluator)
     : random_(random), scope_(scope), tls_(std::move(tls)),
       admission_control_feature_(proto_config.enabled(), runtime),
-      aggression_(
-          proto_config.has_aggression_coefficient()
-              ? std::make_unique<Runtime::Double>(proto_config.aggression_coefficient(), runtime)
-              : nullptr),
+      aggression_(proto_config.has_aggression()
+                      ? std::make_unique<Runtime::Double>(proto_config.aggression(), runtime)
+                      : nullptr),
+      sr_threshold_(proto_config.has_sr_threshold() ? std::make_unique<Runtime::Percentage>(
+                                                          proto_config.sr_threshold(), runtime)
+                                                    : nullptr),
       response_evaluator_(std::move(response_evaluator)) {}
 
 double AdmissionControlFilterConfig::aggression() const {
   return std::max<double>(1.0, aggression_ ? aggression_->value() : defaultAggression);
+}
+
+double AdmissionControlFilterConfig::successRateThreshold() const {
+  const double pct = sr_threshold_ ? sr_threshold_->value() : defaultSuccessRateThreshold;
+  return std::min<double>(pct, 100.0) / 100.0;
 }
 
 AdmissionControlFilter::AdmissionControlFilter(AdmissionControlFilterConfigSharedPtr config,
@@ -52,7 +61,6 @@ AdmissionControlFilter::AdmissionControlFilter(AdmissionControlFilterConfigShare
       record_request_(true) {}
 
 Http::FilterHeadersStatus AdmissionControlFilter::decodeHeaders(Http::RequestHeaderMap&, bool) {
-  // TODO(tonya11en): Ensure we document the fact that healthchecks are ignored.
   if (!config_->filterEnabled() || decoder_callbacks_->streamInfo().healthCheck()) {
     // We must forego recording the success/failure of this request during encoding.
     record_request_ = false;
@@ -60,9 +68,15 @@ Http::FilterHeadersStatus AdmissionControlFilter::decodeHeaders(Http::RequestHea
   }
 
   if (shouldRejectRequest()) {
+    // We do not want to sample requests that we are rejecting, since this taints the measurements
+    // that should be describing the upstreams. In addition, if we were to record the requests
+    // rejected, the rejection probabilities would not converge back to 0 even if the upstream
+    // success rate returns to 100%.
+    record_request_ = false;
+
+    stats_.rq_rejected_.inc();
     decoder_callbacks_->sendLocalReply(Http::Code::ServiceUnavailable, "", nullptr, absl::nullopt,
                                        "denied by admission control");
-    stats_.rq_rejected_.inc();
     return Http::FilterHeadersStatus::StopIteration;
   }
 
@@ -122,9 +136,17 @@ AdmissionControlFilter::encodeTrailers(Http::ResponseTrailerMap& trailers) {
 }
 
 bool AdmissionControlFilter::shouldRejectRequest() const {
-  const double total = config_->getController().requestTotalCount();
-  const double success = config_->getController().requestSuccessCount();
-  const double probability = (total - config_->aggression() * success) / (total + 1);
+  // This formula is documented in the admission control filter documentation:
+  // https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/admission_control_filter.html
+  const auto request_counts = config_->getController().requestCounts();
+  const double total_requests = request_counts.requests;
+  const double successful_requests = request_counts.successes;
+  double probability = total_requests - successful_requests / config_->successRateThreshold();
+  probability = probability / (total_requests + 1);
+  const auto aggression = config_->aggression();
+  if (aggression != 1.0) {
+    probability = std::pow(probability, 1.0 / aggression);
+  }
 
   // Choosing an accuracy of 4 significant figures for the probability.
   static constexpr uint64_t accuracy = 1e4;

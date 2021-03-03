@@ -1,12 +1,12 @@
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
+envoy_extension_package()
 
 # Build targets in this package are part of the QUICHE platform implementation.
 # These implementations are the infrastructure building block for QUIC. They are
@@ -104,6 +104,7 @@ envoy_cc_library(
     deps = [
         "//source/common/common:assert_lib",
         "//source/common/common:stl_helpers",
+        "//source/common/common:utility_lib",
     ],
 )
 
@@ -141,7 +142,6 @@ envoy_cc_library(
         "abseil_node_hash_map",
         "abseil_node_hash_set",
         "abseil_optional",
-        "googletest",
     ],
     tags = ["nofips"],
     visibility = ["//visibility:public"],
@@ -226,6 +226,16 @@ envoy_cc_library(
         "@com_googlesource_quiche//:quic_core_utils_lib",
         "@com_googlesource_quiche//:quic_platform_mem_slice_span",
     ],
+)
+
+envoy_cc_library(
+    name = "quic_platform_udp_socket_impl_lib",
+    hdrs = select({
+        "//bazel:linux": ["quic_udp_socket_platform_impl.h"],
+        "//conditions:default": [],
+    }),
+    repository = "@envoy",
+    tags = ["nofips"],
 )
 
 envoy_cc_library(

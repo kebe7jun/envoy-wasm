@@ -1,7 +1,5 @@
 #include "extensions/access_loggers/wasm/config.h"
 
-#include <unordered_map>
-
 #include "envoy/extensions/access_loggers/wasm/v3/wasm.pb.validate.h"
 #include "envoy/registry/registry.h"
 #include "envoy/server/filter_config.h"
@@ -32,6 +30,7 @@ WasmAccessLogFactory::createAccessLogInstance(const Protobuf::Message& proto_con
   // individual threads.
   auto plugin = std::make_shared<Common::Wasm::Plugin>(
       config.config().name(), config.config().root_id(), config.config().vm_config().vm_id(),
+      config.config().vm_config().runtime(),
       Common::Wasm::anyToBytes(config.config().configuration()), config.config().fail_open(),
       envoy::config::core::v3::TrafficDirection::UNSPECIFIED, context.localInfo(),
       nullptr /* listener_metadata */);
@@ -60,8 +59,8 @@ WasmAccessLogFactory::createAccessLogInstance(const Protobuf::Message& proto_con
 
   if (!Common::Wasm::createWasm(
           config.config().vm_config(), plugin, context.scope().createScope(""),
-          context.clusterManager(), context.initManager(), context.dispatcher(), context.random(),
-          context.api(), context.lifecycleNotifier(), remote_data_provider_, std::move(callback))) {
+          context.clusterManager(), context.initManager(), context.dispatcher(), context.api(),
+          context.lifecycleNotifier(), remote_data_provider_, std::move(callback))) {
     throw Common::Wasm::WasmException(
         fmt::format("Unable to create Wasm access log {}", plugin->name_));
   }

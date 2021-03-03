@@ -11,6 +11,7 @@
 #include "extensions/filters/http/adaptive_concurrency/controller/gradient_controller.h"
 
 #include "test/common/stats/stat_test_utility.h"
+#include "test/mocks/common.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/runtime/mocks.h"
 #include "test/test_common/simulated_time_system.h"
@@ -56,7 +57,8 @@ public:
                                                              stats_, random_, time_system_);
 
     // Advance time so that the latency sample calculations don't underflow if monotonic time is 0.
-    time_system_.advanceTimeAsync(std::chrono::hours(42));
+    time_system_.advanceTimeAndRun(std::chrono::hours(42), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
 
     return config;
   }
@@ -111,7 +113,7 @@ protected:
   NiceMock<Runtime::MockLoader> runtime_;
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
-  NiceMock<Runtime::MockRandomGenerator> random_;
+  NiceMock<Random::MockRandomGenerator> random_;
 };
 
 TEST_F(GradientControllerConfigTest, BasicTest) {
@@ -257,7 +259,7 @@ min_rtt_calc_params:
   const int min_concurrency = 2;
   auto controller = makeController(yaml);
   const auto min_rtt = std::chrono::milliseconds(1350);
-  time_system_.advanceTimeAsync(min_rtt);
+  time_system_.advanceTimeAndRun(min_rtt, *dispatcher_, Event::Dispatcher::RunType::Block);
 
   verifyMinRTTActive();
   EXPECT_EQ(controller->concurrencyLimit(), min_concurrency);
@@ -269,7 +271,8 @@ min_rtt_calc_params:
   uint32_t last_limit = controller->concurrencyLimit();
   for (int i = 0; i < 29; ++i) {
     tryForward(controller, true);
-    time_system_.advanceTimeAsync(std::chrono::seconds(1));
+    time_system_.advanceTimeAndRun(std::chrono::seconds(1), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     sampleLatency(controller, min_rtt);
     dispatcher_->run(Event::Dispatcher::RunType::Block);
     EXPECT_GT(controller->concurrencyLimit(), last_limit);
@@ -285,8 +288,8 @@ min_rtt_calc_params:
   }
 
   // Move into the next minRTT window while the requests are outstanding.
-  time_system_.advanceTimeAsync(std::chrono::seconds(5));
-  dispatcher_->run(Event::Dispatcher::RunType::Block);
+  time_system_.advanceTimeAndRun(std::chrono::seconds(5), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
   verifyMinRTTActive();
   EXPECT_EQ(controller->concurrencyLimit(), min_concurrency);
 
@@ -329,7 +332,7 @@ min_rtt_calc_params:
   }
   tryForward(controller, false);
   tryForward(controller, false);
-  time_system_.advanceTimeAsync(min_rtt);
+  time_system_.advanceTimeAndRun(min_rtt, *dispatcher_, Event::Dispatcher::RunType::Block);
   for (int i = 0; i < 7; ++i) {
     sampleLatency(controller, min_rtt);
   }
@@ -426,8 +429,8 @@ min_rtt_calc_params:
       // prevent the concurrency limit from decreasing.
       sampleLatency(controller, std::chrono::milliseconds(6));
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     EXPECT_GT(controller->concurrencyLimit(), last_concurrency);
   }
 }
@@ -458,8 +461,8 @@ min_rtt_calc_params:
 
   // Ensure that the concurrency window increases on its own due to the headroom calculation with
   // the max gradient.
-  time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-  dispatcher_->run(Event::Dispatcher::RunType::Block);
+  time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
   EXPECT_GE(controller->concurrencyLimit(), 7);
   EXPECT_LE(controller->concurrencyLimit() / 7.0, 2.0);
 
@@ -471,8 +474,8 @@ min_rtt_calc_params:
       tryForward(controller, true);
       sampleLatency(controller, std::chrono::milliseconds(4));
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     // Verify the minimum gradient.
     EXPECT_LE(last_concurrency, controller->concurrencyLimit());
     EXPECT_GE(static_cast<double>(last_concurrency) / controller->concurrencyLimit(), 0.5);
@@ -485,8 +488,8 @@ min_rtt_calc_params:
       tryForward(controller, true);
       sampleLatency(controller, std::chrono::milliseconds(6));
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     EXPECT_LT(controller->concurrencyLimit(), last_concurrency);
     EXPECT_GE(controller->concurrencyLimit(), 7);
   }
@@ -512,7 +515,8 @@ min_rtt_calc_params:
   // Get initial minRTT measurement out of the way and advance time so request samples are not
   // thought to come from the previous minRTT epoch.
   advancePastMinRTTStage(controller, yaml, std::chrono::milliseconds(5));
-  time_system_.advanceTimeAsync(std::chrono::seconds(1));
+  time_system_.advanceTimeAndRun(std::chrono::seconds(1), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
 
   // Force the limit calculation to run a few times from some measurements.
   for (int sample_iters = 0; sample_iters < 5; ++sample_iters) {
@@ -521,8 +525,8 @@ min_rtt_calc_params:
       tryForward(controller, true);
       sampleLatency(controller, std::chrono::milliseconds(4));
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     // Verify the value is growing.
     EXPECT_GT(controller->concurrencyLimit(), last_concurrency);
   }
@@ -530,12 +534,13 @@ min_rtt_calc_params:
   const auto limit_val = controller->concurrencyLimit();
 
   // Wait until the minRTT recalculation is triggered again and verify the limit drops.
-  time_system_.advanceTimeAsync(std::chrono::seconds(31));
-  dispatcher_->run(Event::Dispatcher::RunType::Block);
+  time_system_.advanceTimeAndRun(std::chrono::seconds(31), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
   EXPECT_EQ(controller->concurrencyLimit(), 3);
 
   // Advance time again for request samples to appear from the current epoch.
-  time_system_.advanceTimeAsync(std::chrono::seconds(1));
+  time_system_.advanceTimeAndRun(std::chrono::seconds(1), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
 
   // 49 more requests should cause the minRTT to be done calculating.
   for (int i = 0; i < 5; ++i) {
@@ -568,7 +573,8 @@ min_rtt_calc_params:
   // Get initial minRTT measurement out of the way and advance time so request samples are not
   // thought to come from the previous minRTT epoch.
   advancePastMinRTTStage(controller, yaml, std::chrono::milliseconds(5));
-  time_system_.advanceTimeAsync(std::chrono::seconds(1));
+  time_system_.advanceTimeAndRun(std::chrono::seconds(1), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
 
   // Force the limit calculation to run a few times from some measurements.
   for (int sample_iters = 0; sample_iters < 5; ++sample_iters) {
@@ -577,20 +583,20 @@ min_rtt_calc_params:
       tryForward(controller, true);
       sampleLatency(controller, std::chrono::milliseconds(4));
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     // Verify the value is growing.
     EXPECT_GT(controller->concurrencyLimit(), last_concurrency);
   }
 
   // Wait until the minRTT recalculation is triggered again and verify the limit drops.
-  time_system_.advanceTimeAsync(std::chrono::seconds(31));
-  dispatcher_->run(Event::Dispatcher::RunType::Block);
+  time_system_.advanceTimeAndRun(std::chrono::seconds(31), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
   EXPECT_EQ(controller->concurrencyLimit(), 3);
 
   // Verify sample recalculation doesn't occur during the minRTT window.
-  time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-  dispatcher_->run(Event::Dispatcher::RunType::Block);
+  time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
   EXPECT_EQ(controller->concurrencyLimit(), 3);
 }
 
@@ -621,8 +627,8 @@ min_rtt_calc_params:
       tryForward(controller, true);
       sampleLatency(controller, std::chrono::milliseconds(4));
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     // Verify the value is growing.
     EXPECT_GT(controller->concurrencyLimit(), last_concurrency);
   }
@@ -630,8 +636,8 @@ min_rtt_calc_params:
   // Now we make sure that the limit value doesn't change in the absence of samples.
   for (int sample_iters = 0; sample_iters < 5; ++sample_iters) {
     const auto old_limit = controller->concurrencyLimit();
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     EXPECT_EQ(old_limit, controller->concurrencyLimit());
   }
 }
@@ -675,7 +681,8 @@ min_rtt_calc_params:
   EXPECT_CALL(*sample_timer, enableTimer(std::chrono::milliseconds(123), _));
   for (int i = 0; i < 6; ++i) {
     tryForward(controller, true);
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(5));
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(5), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     sampleLatency(controller, std::chrono::milliseconds(5));
   }
 }
@@ -715,7 +722,8 @@ min_rtt_calc_params:
   EXPECT_CALL(*sample_timer, enableTimer(std::chrono::milliseconds(123), _));
   for (int i = 0; i < 6; ++i) {
     tryForward(controller, true);
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(5));
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(5), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     sampleLatency(controller, std::chrono::milliseconds(5));
   }
 }
@@ -748,8 +756,8 @@ min_rtt_calc_params:
 
   // Ensure that the concurrency window increases on its own due to the headroom calculation with
   // the max gradient.
-  time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-  dispatcher_->run(Event::Dispatcher::RunType::Block);
+  time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                 Event::Dispatcher::RunType::Block);
   EXPECT_GE(controller->concurrencyLimit(), 7);
   EXPECT_LE(controller->concurrencyLimit() / 7.0, 2.0);
 
@@ -761,8 +769,8 @@ min_rtt_calc_params:
       tryForward(controller, true);
       sampleLatency(controller, elevated_latency);
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
   }
 
   // Verify that the concurrency limit starts growing with newly measured minRTT.
@@ -772,8 +780,8 @@ min_rtt_calc_params:
       tryForward(controller, true);
       sampleLatency(controller, elevated_latency);
     }
-    time_system_.advanceTimeAsync(std::chrono::milliseconds(101));
-    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    time_system_.advanceTimeAndRun(std::chrono::milliseconds(101), *dispatcher_,
+                                   Event::Dispatcher::RunType::Block);
     EXPECT_GE(controller->concurrencyLimit(), last_concurrency);
   }
 }

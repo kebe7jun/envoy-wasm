@@ -34,7 +34,10 @@ namespace Ssl {
 void SslIntegrationTestBase::initialize() {
   config_helper_.addSslConfig(ConfigHelper::ServerSslOptions()
                                   .setRsaCert(server_rsa_cert_)
+                                  .setRsaCertOcspStaple(server_rsa_cert_ocsp_staple_)
                                   .setEcdsaCert(server_ecdsa_cert_)
+                                  .setEcdsaCertOcspStaple(server_ecdsa_cert_ocsp_staple_)
+                                  .setOcspStapleRequired(ocsp_staple_required_)
                                   .setTlsV13(server_tlsv1_3_)
                                   .setExpectClientEcdsaCert(client_ecdsa_cert_));
   HttpIntegrationTest::initialize();
@@ -286,7 +289,8 @@ TEST_P(SslCertficateIntegrationTest, ServerEcdsaClientRsaOnly) {
   server_rsa_cert_ = false;
   server_ecdsa_cert_ = true;
   initialize();
-  auto codec_client = makeRawHttpConnection(makeSslClientConnection(rsaOnlyClientOptions()));
+  auto codec_client =
+      makeRawHttpConnection(makeSslClientConnection(rsaOnlyClientOptions()), absl::nullopt);
   EXPECT_FALSE(codec_client->connected());
   const std::string counter_name = listenerStatPrefix("ssl.connection_error");
   Stats::CounterSharedPtr counter = test_server_->counter(counter_name);
@@ -313,7 +317,8 @@ TEST_P(SslCertficateIntegrationTest, ServerRsaClientEcdsaOnly) {
   client_ecdsa_cert_ = true;
   initialize();
   EXPECT_FALSE(
-      makeRawHttpConnection(makeSslClientConnection(ecdsaOnlyClientOptions()))->connected());
+      makeRawHttpConnection(makeSslClientConnection(ecdsaOnlyClientOptions()), absl::nullopt)
+          ->connected());
   const std::string counter_name = listenerStatPrefix("ssl.connection_error");
   Stats::CounterSharedPtr counter = test_server_->counter(counter_name);
   test_server_->waitForCounterGe(counter_name, 1);
@@ -344,6 +349,60 @@ TEST_P(SslCertficateIntegrationTest, ServerRsaEcdsaClientEcdsaOnly) {
   testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
   checkStats();
 }
+
+// Server has an RSA certificate with an OCSP response works.
+TEST_P(SslCertficateIntegrationTest, ServerRsaOnlyOcspResponse) {
+  server_rsa_cert_ = true;
+  server_rsa_cert_ocsp_staple_ = true;
+  ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+    return makeSslClientConnection(rsaOnlyClientOptions());
+  };
+  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+  checkStats();
+}
+
+// Server has an ECDSA certificate with an OCSP response works.
+TEST_P(SslCertficateIntegrationTest, ServerEcdsaOnlyOcspResponse) {
+  server_ecdsa_cert_ = true;
+  server_ecdsa_cert_ocsp_staple_ = true;
+  client_ecdsa_cert_ = true;
+  ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+    return makeSslClientConnection(ecdsaOnlyClientOptions());
+  };
+  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+  checkStats();
+}
+
+// Server has two certificates one with and one without OCSP response works under optional policy.
+TEST_P(SslCertficateIntegrationTest, BothEcdsaAndRsaOnlyRsaOcspResponse) {
+  server_rsa_cert_ = true;
+  server_rsa_cert_ocsp_staple_ = true;
+  server_ecdsa_cert_ = true;
+  client_ecdsa_cert_ = true;
+  ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+    return makeSslClientConnection(ecdsaOnlyClientOptions());
+  };
+  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+  checkStats();
+}
+
+// Server has ECDSA and RSA certificates with OCSP responses and stapling required policy works.
+TEST_P(SslCertficateIntegrationTest, BothEcdsaAndRsaWithOcspResponseStaplingRequired) {
+  server_rsa_cert_ = true;
+  server_rsa_cert_ocsp_staple_ = true;
+  server_ecdsa_cert_ = true;
+  server_ecdsa_cert_ocsp_staple_ = true;
+  ocsp_staple_required_ = true;
+  client_ecdsa_cert_ = true;
+  ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+    return makeSslClientConnection(ecdsaOnlyClientOptions());
+  };
+  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+  checkStats();
+}
+
+// TODO(zuercher): write an additional OCSP integration test that validates behavior with an
+// expired OCSP response. (Requires OCSP client-side support in upstream TLS.)
 
 // TODO(mattklein123): Move this into a dedicated integration test for the tap transport socket as
 // well as add more tests.
@@ -394,10 +453,8 @@ public:
   envoy::extensions::transport_sockets::tap::v3::Tap
   createTapConfig(const envoy::config::core::v3::TransportSocket& inner_transport) {
     envoy::extensions::transport_sockets::tap::v3::Tap tap_config;
-    tap_config.mutable_common_config()
-        ->mutable_static_config()
-        ->mutable_match_config()
-        ->set_any_match(true);
+    tap_config.mutable_common_config()->mutable_static_config()->mutable_match()->set_any_match(
+        true);
     auto* output_config =
         tap_config.mutable_common_config()->mutable_static_config()->mutable_output_config();
     if (max_rx_bytes_.has_value()) {

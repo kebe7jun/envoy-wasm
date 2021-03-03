@@ -5,6 +5,7 @@
 #include "common/common/base64.h"
 #include "common/common/hex.h"
 #include "common/crypto/utility.h"
+#include "common/http/message_impl.h"
 #include "common/stats/isolated_store_impl.h"
 
 #include "extensions/common/wasm/wasm.h"
@@ -22,9 +23,13 @@ using testing::ReturnRef;
 
 namespace Envoy {
 namespace Extensions {
+
+using Common::Wasm::WasmException;
+
 namespace HttpFilters {
 namespace Wasm {
 
+#if defined(ENVOY_WASM_V8) || defined(ENVOY_WASM_WAVM)
 class WasmFilterConfigTest : public Event::TestUsingSimulatedTime,
                              public testing::TestWithParam<std::string> {
 protected:
@@ -37,7 +42,7 @@ protected:
     ON_CALL(context_, dispatcher()).WillByDefault(ReturnRef(dispatcher_));
   }
 
-  void SetUp() { Envoy::Extensions::Common::Wasm::clearCodeCacheForTesting(false); }
+  void SetUp() override { Envoy::Extensions::Common::Wasm::clearCodeCacheForTesting(); }
 
   void initializeForRemote() {
     retry_timer_ = new Event::MockTimer();
@@ -60,13 +65,21 @@ protected:
   Event::TimerCb retry_timer_cb_;
 };
 
-INSTANTIATE_TEST_SUITE_P(Runtimes, WasmFilterConfigTest,
-                         testing::Values("v8"
-#if defined(ENVOY_WASM_WAVM)
-                                         ,
-                                         "wavm"
+// NB: this is required by VC++ which can not handle the use of macros in the macro definitions
+// used by INSTANTIATE_TEST_SUITE_P.
+auto testing_values = testing::Values(
+#if defined(ENVOY_WASM_V8)
+    "v8"
 #endif
-                                         ));
+#if defined(ENVOY_WASM_V8) && defined(ENVOY_WASM_WAVM)
+    ,
+#endif
+#if defined(ENVOY_WASM_WAVM)
+    "wavm"
+#endif
+);
+INSTANTIATE_TEST_SUITE_P(Runtimes, WasmFilterConfigTest, testing_values);
+
 TEST_P(WasmFilterConfigTest, JsonLoadFromFileWasm) {
   const std::string json = TestEnvironment::substitute(absl::StrCat(R"EOF(
   {
@@ -80,7 +93,7 @@ TEST_P(WasmFilterConfigTest, JsonLoadFromFileWasm) {
     },
     "code": {
       "local": {
-        "filename": "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"
+        "filename": "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"
       }
     },
   }}}
@@ -110,7 +123,35 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromFileWasm) {
          value: "some configuration"
       code:
         local:
-          filename: "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"
+          filename: "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"
+  )EOF"));
+
+  envoy::extensions::filters::http::wasm::v3::Wasm proto_config;
+  TestUtility::loadFromYaml(yaml, proto_config);
+  WasmFilterConfig factory;
+  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context_);
+  EXPECT_CALL(init_watcher_, ready());
+  context_.initManager().initialize(init_watcher_);
+  EXPECT_EQ(context_.initManager().state(), Init::Manager::State::Initialized);
+  Http::MockFilterChainFactoryCallbacks filter_callback;
+  EXPECT_CALL(filter_callback, addStreamFilter(_));
+  EXPECT_CALL(filter_callback, addAccessLogHandler(_));
+  cb(filter_callback);
+}
+
+TEST_P(WasmFilterConfigTest, YamlLoadFromFileWasmFailOpenOk) {
+  const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
+  config:
+    fail_open: true
+    vm_config:
+      runtime: "envoy.wasm.runtime.)EOF",
+                                                                    GetParam(), R"EOF("
+      configuration:
+         "@type": "type.googleapis.com/google.protobuf.StringValue"
+         value: "some configuration"
+      code:
+        local:
+          filename: "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"
   )EOF"));
 
   envoy::extensions::filters::http::wasm::v3::Wasm proto_config;
@@ -128,7 +169,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromFileWasm) {
 
 TEST_P(WasmFilterConfigTest, YamlLoadInlineWasm) {
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   EXPECT_FALSE(code.empty());
   const std::string yaml = absl::StrCat(R"EOF(
   config:
@@ -167,13 +208,12 @@ TEST_P(WasmFilterConfigTest, YamlLoadInlineBadCode) {
   TestUtility::loadFromYaml(yaml, proto_config);
   WasmFilterConfig factory;
   EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(proto_config, "stats", context_),
-                            Extensions::Common::Wasm::WasmException,
-                            "Unable to create Wasm HTTP filter ");
+                            WasmException, "Unable to create Wasm HTTP filter ");
 }
 
 TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasm) {
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   const std::string sha256 = Hex::encode(
       Envoy::Common::Crypto::UtilitySingleton::get().getSha256Digest(Buffer::OwnedImpl(code)));
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
@@ -204,7 +244,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasm) {
             Http::ResponseMessagePtr response(
                 new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                     new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
-            response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+            response->body().add(code);
             callbacks.onSuccess(request, std::move(response));
             return &request;
           }));
@@ -220,14 +260,14 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasm) {
 }
 
 TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailOnUncachedThenSucceed) {
-  Envoy::Extensions::Common::Wasm::clearCodeCacheForTesting(true);
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   const std::string sha256 = Hex::encode(
       Envoy::Common::Crypto::UtilitySingleton::get().getSha256Digest(Buffer::OwnedImpl(code)));
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
   config:
     vm_config:
+      nack_on_code_cache_miss: true
       runtime: "envoy.wasm.runtime.)EOF",
                                                                     GetParam(), R"EOF("
       code:
@@ -253,12 +293,13 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailOnUncachedThenSucceed) {
             Http::ResponseMessagePtr response(
                 new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                     new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
-            response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+            response->body().add(code);
             callbacks.onSuccess(request, std::move(response));
             return &request;
           }));
 
-  factory.createFilterFactoryFromProto(proto_config, "stats", context_);
+  EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(proto_config, "stats", context_),
+                            WasmException, "Unable to create Wasm HTTP filter ");
 
   EXPECT_CALL(init_watcher_, ready());
   context_.initManager().initialize(init_watcher_);
@@ -269,7 +310,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailOnUncachedThenSucceed) {
 
   EXPECT_CALL(context_, initManager()).WillRepeatedly(ReturnRef(init_manager2));
 
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context_);
+  auto cb = factory.createFilterFactoryFromProto(proto_config, "stats", context_);
 
   EXPECT_CALL(init_watcher2, ready());
   init_manager2.initialize(init_watcher2);
@@ -284,14 +325,14 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailOnUncachedThenSucceed) {
 }
 
 TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
-  Envoy::Extensions::Common::Wasm::clearCodeCacheForTesting(true);
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   const std::string sha256 = Hex::encode(
       Envoy::Common::Crypto::UtilitySingleton::get().getSha256Digest(Buffer::OwnedImpl(code)));
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
   config:
     vm_config:
+      nack_on_code_cache_miss: true
       runtime: "envoy.wasm.runtime.)EOF",
                                                                     GetParam(), R"EOF("
       code:
@@ -313,19 +354,33 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
   EXPECT_CALL(cluster_manager_, httpAsyncClientForCluster("cluster_1"))
       .WillRepeatedly(ReturnRef(cluster_manager_.async_client_));
 
+  Http::AsyncClient::Callbacks* async_callbacks = nullptr;
   EXPECT_CALL(cluster_manager_.async_client_, send_(_, _, _))
       .WillRepeatedly(
           Invoke([&](Http::RequestMessagePtr&, Http::AsyncClient::Callbacks& callbacks,
                      const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
-            callbacks.onSuccess(
-                request,
-                Http::ResponseMessagePtr{new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
-                    new Http::TestResponseHeaderMapImpl{{":status", "503"}}})});
+            // Store the callback the first time through for delayed call.
+            if (!async_callbacks) {
+              async_callbacks = &callbacks;
+            } else {
+              // Subsequent send()s happen inline.
+              callbacks.onSuccess(
+                  request,
+                  Http::ResponseMessagePtr{new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
+                      new Http::TestResponseHeaderMapImpl{{":status", "503"}}})});
+            }
             return &request;
           }));
 
   // Case 1: fail and fetch in the background, got 503, cache failure.
-  factory.createFilterFactoryFromProto(proto_config, "stats", context_);
+  EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(proto_config, "stats", context_),
+                            WasmException, "Unable to create Wasm HTTP filter ");
+  // Fail a second time because we are in-progress.
+  EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(proto_config, "stats", context_),
+                            WasmException, "Unable to create Wasm HTTP filter ");
+  async_callbacks->onSuccess(
+      request, Http::ResponseMessagePtr{new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
+                   new Http::TestResponseHeaderMapImpl{{":status", "503"}}})});
 
   EXPECT_CALL(init_watcher_, ready());
   context_.initManager().initialize(init_watcher_);
@@ -336,7 +391,8 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
   Init::ExpectableWatcherImpl init_watcher2;
 
   EXPECT_CALL(context_, initManager()).WillRepeatedly(ReturnRef(init_manager2));
-  factory.createFilterFactoryFromProto(proto_config, "stats", context_);
+  EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(proto_config, "stats", context_),
+                            WasmException, "Unable to create Wasm HTTP filter ");
 
   EXPECT_CALL(init_watcher2, ready());
   init_manager2.initialize(init_watcher2);
@@ -352,7 +408,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
             Http::ResponseMessagePtr response(
                 new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                     new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
-            response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+            response->body().add(code);
             callbacks.onSuccess(request, std::move(response));
             return &request;
           }));
@@ -363,7 +419,8 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
 
   EXPECT_CALL(context_, initManager()).WillRepeatedly(ReturnRef(init_manager3));
 
-  factory.createFilterFactoryFromProto(proto_config, "stats", context_);
+  EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(proto_config, "stats", context_),
+                            WasmException, "Unable to create Wasm HTTP filter ");
 
   EXPECT_CALL(init_watcher3, ready());
   init_manager3.initialize(init_watcher3);
@@ -396,6 +453,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
   const std::string yaml2 = TestEnvironment::substitute(absl::StrCat(R"EOF(
   config:
     vm_config:
+      nack_on_code_cache_miss: true
       runtime: "envoy.wasm.runtime.)EOF",
                                                                      GetParam(), R"EOF("
       code:
@@ -417,7 +475,8 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
 
   EXPECT_CALL(context_, initManager()).WillRepeatedly(ReturnRef(init_manager5));
 
-  factory.createFilterFactoryFromProto(proto_config2, "stats", context_);
+  EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(proto_config2, "stats", context_),
+                            WasmException, "Unable to create Wasm HTTP filter ");
 
   EXPECT_CALL(init_watcher_, ready());
   context_.initManager().initialize(init_watcher_);
@@ -458,7 +517,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteWasmFailCachedThenSucceed) {
 
 TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteConnectionReset) {
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   const std::string sha256 = Hex::encode(
       Envoy::Common::Crypto::UtilitySingleton::get().getSha256Digest(Buffer::OwnedImpl(code)));
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
@@ -499,7 +558,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteConnectionReset) {
 
 TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessWith503) {
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   const std::string sha256 = Hex::encode(
       Envoy::Common::Crypto::UtilitySingleton::get().getSha256Digest(Buffer::OwnedImpl(code)));
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
@@ -543,7 +602,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessWith503) {
 
 TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessIncorrectSha256) {
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   const std::string sha256 = Hex::encode(
       Envoy::Common::Crypto::UtilitySingleton::get().getSha256Digest(Buffer::OwnedImpl(code)));
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
@@ -575,7 +634,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessIncorrectSha256) {
             Http::ResponseMessagePtr response(
                 new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                     new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
-            response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+            response->body().add(code);
             callbacks.onSuccess(request, std::move(response));
             return &request;
           }));
@@ -588,7 +647,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessIncorrectSha256) {
 TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteMultipleRetries) {
   initializeForRemote();
   const std::string code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
-      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/headers_cpp.wasm"));
+      "{{ test_rundir }}/test/extensions/filters/http/wasm/test_data/test_cpp.wasm"));
   const std::string sha256 = Hex::encode(
       Envoy::Common::Crypto::UtilitySingleton::get().getSha256Digest(Buffer::OwnedImpl(code)));
   const std::string yaml = TestEnvironment::substitute(absl::StrCat(R"EOF(
@@ -622,7 +681,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteMultipleRetries) {
             Http::ResponseMessagePtr response(
                 new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                     new Http::TestResponseHeaderMapImpl{{":status", "503"}}}));
-            response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+            response->body().add(code);
             callbacks.onSuccess(request, std::move(response));
             return &request;
           }));
@@ -637,7 +696,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteMultipleRetries) {
                     Http::ResponseMessagePtr response(
                         new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                             new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
-                    response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+                    response->body().add(code);
                     callbacks.onSuccess(request, std::move(response));
                     return &request;
                   }));
@@ -689,7 +748,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessBadcode) {
             Http::ResponseMessagePtr response(
                 new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                     new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
-            response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+            response->body().add(code);
             callbacks.onSuccess(request, std::move(response));
             return nullptr;
           }));
@@ -711,7 +770,11 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessBadcode) {
   EXPECT_TRUE(context->isFailed());
 
   Http::MockStreamDecoderFilterCallbacks decoder_callbacks;
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+
   context->setDecoderFilterCallbacks(decoder_callbacks);
+  EXPECT_CALL(decoder_callbacks, streamInfo()).WillRepeatedly(ReturnRef(stream_info));
+  EXPECT_CALL(stream_info, setResponseCodeDetails("wasm_fail_stream"));
   EXPECT_CALL(decoder_callbacks, resetStream());
 
   EXPECT_EQ(context->onRequestHeaders(10, false), proxy_wasm::FilterHeadersStatus::StopIteration);
@@ -750,7 +813,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessBadcodeFailOpen) {
             Http::ResponseMessagePtr response(
                 new Http::ResponseMessageImpl(Http::ResponseHeaderMapPtr{
                     new Http::TestResponseHeaderMapImpl{{":status", "200"}}}));
-            response->body() = std::make_unique<Buffer::OwnedImpl>(code);
+            response->body().add(code);
             callbacks.onSuccess(request, std::move(response));
             return nullptr;
           }));
@@ -762,6 +825,7 @@ TEST_P(WasmFilterConfigTest, YamlLoadFromRemoteSuccessBadcodeFailOpen) {
   // The filter is not registered.
   cb(filter_callback);
 }
+#endif
 
 } // namespace Wasm
 } // namespace HttpFilters

@@ -1,6 +1,8 @@
 // NOLINT(namespace-envoy)
-#include <unistd.h>
+#ifndef WIN32
+#include "unistd.h"
 
+#endif
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +21,7 @@ START_WASM_PLUGIN(CommonWasmTestCpp)
 static int* badptr = nullptr;
 static float gNan = std::nan("1");
 static float gInfinity = INFINITY;
+volatile double zero_unbeknownst_to_the_compiler = 0.0;
 
 #ifndef CHECK_RESULT
 #define CHECK_RESULT(_c)                                                                           \
@@ -30,12 +33,22 @@ static float gInfinity = INFINITY;
   } while (0)
 #endif
 
+#define CHECK_RESULT_NOT_OK(_c)                                                                    \
+  do {                                                                                             \
+    if ((_c) == WasmResult::Ok) {                                                                  \
+      proxy_log(LogLevel::critical, #_c, sizeof(#_c) - 1);                                         \
+      abort();                                                                                     \
+    }                                                                                              \
+  } while (0)
+
 #define FAIL_NOW(_msg)                                                                             \
   do {                                                                                             \
     const std::string __message = _msg;                                                            \
     proxy_log(LogLevel::critical, __message.c_str(), __message.size());                            \
     abort();                                                                                       \
   } while (0)
+
+WASM_EXPORT(void, proxy_abi_version_0_2_1, (void)) {}
 
 WASM_EXPORT(void, proxy_on_context_create, (uint32_t, uint32_t)) {}
 
@@ -54,6 +67,10 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
     proxy_log(LogLevel::warn, warn_message.c_str(), warn_message.size());
     std::string error_message = "test error logging";
     proxy_log(LogLevel::error, error_message.c_str(), error_message.size());
+    LogLevel log_level;
+    CHECK_RESULT(proxy_get_log_level(&log_level));
+    std::string level_message = "log level is " + std::to_string(static_cast<uint32_t>(log_level));
+    proxy_log(LogLevel::info, level_message.c_str(), level_message.size());
   } else if (configuration == "segv") {
     std::string message = "before badptr";
     proxy_log(LogLevel::error, message.c_str(), message.size());
@@ -64,8 +81,8 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
   } else if (configuration == "divbyzero") {
     std::string message = "before div by zero";
     proxy_log(LogLevel::error, message.c_str(), message.size());
-    int zero = context_id / 1000;
     ::free(const_cast<void*>(reinterpret_cast<const void*>(configuration_ptr)));
+    int zero = context_id & 0x100000;
     message = "divide by zero: " + std::to_string(100 / zero);
     proxy_log(LogLevel::error, message.c_str(), message.size());
   } else if (configuration == "globals") {
@@ -73,7 +90,7 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
     proxy_log(LogLevel::warn, message.c_str(), message.size());
     message = "inf " + std::to_string(gInfinity);
     proxy_log(LogLevel::warn, message.c_str(), message.size());
-    message = "inf " + std::to_string(1.0 / 0.0);
+    message = "inf " + std::to_string(1.0 / zero_unbeknownst_to_the_compiler);
     proxy_log(LogLevel::warn, message.c_str(), message.size());
     message = std::string("inf ") + (std::isinf(gInfinity) ? "inf" : "nan");
     proxy_log(LogLevel::warn, message.c_str(), message.size());
@@ -86,12 +103,31 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
     CHECK_RESULT(proxy_define_metric(MetricType::Gauge, name.data(), name.size(), &g));
     name = "test_historam";
     CHECK_RESULT(proxy_define_metric(MetricType::Histogram, name.data(), name.size(), &h));
+    // Bad type.
+    CHECK_RESULT_NOT_OK(
+        proxy_define_metric(static_cast<MetricType>(9999), name.data(), name.size(), &c));
 
     CHECK_RESULT(proxy_increment_metric(c, 1));
+    CHECK_RESULT(proxy_increment_metric(g, 1));
+    CHECK_RESULT_NOT_OK(proxy_increment_metric(h, 1));
     CHECK_RESULT(proxy_record_metric(g, 2));
     CHECK_RESULT(proxy_record_metric(h, 3));
 
     uint64_t value;
+    // Not found
+    CHECK_RESULT_NOT_OK(proxy_get_metric((1 << 10) + 0, &value));
+    CHECK_RESULT_NOT_OK(proxy_get_metric((1 << 10) + 1, &value));
+    CHECK_RESULT_NOT_OK(proxy_get_metric((1 << 10) + 2, &value));
+    CHECK_RESULT_NOT_OK(proxy_get_metric((1 << 10) + 3, &value));
+    CHECK_RESULT_NOT_OK(proxy_record_metric((1 << 10) + 0, 1));
+    CHECK_RESULT_NOT_OK(proxy_record_metric((1 << 10) + 1, 1));
+    CHECK_RESULT_NOT_OK(proxy_record_metric((1 << 10) + 2, 1));
+    CHECK_RESULT_NOT_OK(proxy_record_metric((1 << 10) + 3, 1));
+    CHECK_RESULT_NOT_OK(proxy_increment_metric((1 << 10) + 0, 1));
+    CHECK_RESULT_NOT_OK(proxy_increment_metric((1 << 10) + 1, 1));
+    CHECK_RESULT_NOT_OK(proxy_increment_metric((1 << 10) + 2, 1));
+    CHECK_RESULT_NOT_OK(proxy_increment_metric((1 << 10) + 3, 1));
+    // Found.
     std::string message;
     CHECK_RESULT(proxy_get_metric(c, &value));
     message = std::string("get counter = ") + std::to_string(value);
@@ -112,15 +148,19 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
       message = std::string("get histogram = Unsupported");
       proxy_log(LogLevel::error, message.c_str(), message.size());
     }
+    // Negative.
+    CHECK_RESULT_NOT_OK(proxy_increment_metric(c, -1));
+    CHECK_RESULT(proxy_increment_metric(g, -1));
   } else if (configuration == "foreign") {
     std::string function = "compress";
-    std::string argument = "something to compress dup dup dup dup dup";
     char* compressed = nullptr;
     size_t compressed_size = 0;
+    std::string argument = std::string(2000, 'a'); // super compressible.
+    std::string message;
     CHECK_RESULT(proxy_call_foreign_function(function.data(), function.size(), argument.data(),
                                              argument.size(), &compressed, &compressed_size));
-    auto message = std::string("compress ") + std::to_string(argument.size()) + " -> " +
-                   std::to_string(compressed_size);
+    message = std::string("compress ") + std::to_string(argument.size()) + " -> " +
+              std::to_string(compressed_size);
     proxy_log(LogLevel::trace, message.c_str(), message.size());
     function = "uncompress";
     char* result = nullptr;
@@ -134,10 +174,25 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
       message = "compress mismatch ";
       proxy_log(LogLevel::error, message.c_str(), message.size());
     }
-    ::free(compressed);
     ::free(result);
+    result = nullptr;
+    memset(compressed, 0, 4); // damage the compressed version.
+    if (proxy_call_foreign_function(function.data(), function.size(), compressed, compressed_size,
+                                    &result, &result_size) != WasmResult::SerializationFailure) {
+      message = "bad uncompress should be an error";
+      proxy_log(LogLevel::error, message.c_str(), message.size());
+    }
+    if (compressed) {
+      ::free(compressed);
+    }
+    if (result) {
+      ::free(result);
+    }
+  } else if (configuration == "configuration") {
+    std::string message = "configuration";
+    proxy_log(LogLevel::error, message.c_str(), message.size());
   } else if (configuration == "WASI") {
-    // These checks depend on Emscripten's support for WASI and will only
+    // These checks depend on Emscripten's support for `WASI` and will only
     // work if invoked on a "real" Wasm VM.
     int err = fprintf(stdout, "WASI write to stdout\n");
     if (err < 0) {
@@ -158,7 +213,8 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
     if (pathenv != nullptr) {
       FAIL_NOW("PATH environment variable should not be available");
     }
-    // Exercise the WASI "fd_fdstat_get" a little bit
+#ifndef WIN32
+    // Exercise the `WASI` `fd_fdstat_get` a little bit
     int tty = isatty(1);
     if (errno != ENOTTY || tty != 0) {
       FAIL_NOW("stdout is not a tty");
@@ -171,6 +227,7 @@ WASM_EXPORT(uint32_t, proxy_on_vm_start, (uint32_t context_id, uint32_t configur
     if (errno != EBADF || tty != 0) {
       FAIL_NOW("isatty errors on bad fds. errno = " + std::to_string(errno));
     }
+#endif
   } else if (configuration == "on_foreign") {
     std::string message = "on_foreign start";
     proxy_log(LogLevel::debug, message.c_str(), message.size());

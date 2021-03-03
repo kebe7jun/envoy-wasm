@@ -20,11 +20,13 @@ recent Linux including Ubuntu 18.04 LTS.
 
 Building Envoy has the following requirements:
 
-* GCC 7+ or Clang/LLVM 7+ (for C++14 support).
+* GCC 7+ or Clang/LLVM 7+ (for C++14 support). Clang/LLVM 9+ preferred where Clang is used (see below).
 * These :repo:`Bazel native <bazel/repository_locations.bzl>` dependencies.
 
 Please see the linked :repo:`CI <ci/README.md>` and :repo:`Bazel <bazel/README.md>` documentation
 for more information on performing manual builds.
+Please note that for Clang/LLVM 8 and lower, Envoy may need to be built with `--define tcmalloc=gperftools`
+as the new tcmalloc code is not guaranteed to compile with lower versions of Clang.
 
 .. _install_binaries:
 
@@ -36,9 +38,12 @@ be found in the following repositories:
 
 * `envoyproxy/envoy <https://hub.docker.com/r/envoyproxy/envoy/tags/>`_: Release binary with
   symbols stripped on top of an Ubuntu Bionic base.
+* `envoyproxy/envoy-debug <https://hub.docker.com/r/envoyproxy/envoy-debug/tags/>`_: Release
+  binary with debug symbols on top of an Ubuntu Bionic base.
 * `envoyproxy/envoy-alpine <https://hub.docker.com/r/envoyproxy/envoy-alpine/tags/>`_: Release
   binary with symbols stripped on top of a **glibc** alpine base.
 * `envoyproxy/envoy-alpine-debug <https://hub.docker.com/r/envoyproxy/envoy-alpine-debug/tags/>`_:
+  *Deprecated in favor of envoyproxy/envoy-debug.* Release binary with debug symbols on top of a
   Release binary with debug symbols on top of a **glibc** alpine base.
 
 .. note::
@@ -50,10 +55,13 @@ be found in the following repositories:
 
 * `envoyproxy/envoy-dev <https://hub.docker.com/r/envoyproxy/envoy-dev/tags/>`_: Release binary with
   symbols stripped on top of an Ubuntu Bionic base.
+* `envoyproxy/envoy-debug-dev <https://hub.docker.com/r/envoyproxy/envoy-debug-dev/tags/>`_: Release
+  binary with debug symbols on top of an Ubuntu Bionic base.
 * `envoyproxy/envoy-alpine-dev <https://hub.docker.com/r/envoyproxy/envoy-alpine-dev/tags/>`_: Release
   binary with symbols stripped on top of a **glibc** alpine base.
 * `envoyproxy/envoy-alpine-debug-dev <https://hub.docker.com/r/envoyproxy/envoy-alpine-debug-dev/tags/>`_:
-  Release binary with debug symbols on top of a **glibc** alpine base.
+  *Deprecated in favor of envoyproxy/envoy-debug-dev.* Release binary with debug symbols on top of a
+  **glibc** alpine base.
 
 In the above *dev* repositories, the *latest* tag points to the last Envoy SHA in master that passed
 tests.
@@ -70,6 +78,18 @@ Packaged Envoy pre-built binaries for a variety of platforms are available via
 We will consider producing additional binary types depending on community interest in helping with
 CI, packaging, etc. Please open an `issue in GetEnvoy <https://github.com/tetratelabs/getenvoy/issues>`_
 for pre-built binaries for different platforms.
+
+.. _arm_binaries:
+
+ARM64 binaries
+^^^^^^^^^^^^^^
+
+`envoyproxy/envoy <https://hub.docker.com/r/envoyproxy/envoy/tags/>`_,
+`envoyproxy/envoy-debug <https://hub.docker.com/r/envoyproxy/envoy-debug/tags/>`_,
+`envoyproxy/envoy-dev <https://hub.docker.com/r/envoyproxy/envoy-dev/tags/>`_ and
+`envoyproxy/envoy-debug-dev <https://hub.docker.com/r/envoyproxy/envoy-debug-dev/tags/>`_ are Docker
+`multi-arch <https://www.docker.com/blog/multi-arch-build-and-images-the-simple-way/>`_ images
+and should run transparently on compatible ARM64 hosts.
 
 Modifying Envoy
 ---------------

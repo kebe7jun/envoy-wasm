@@ -8,7 +8,7 @@
 
 #include "test/mocks/api/hot_restart.h"
 #include "test/mocks/api/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/hot_restart.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/threadsafe_singleton_injector.h"
 
@@ -43,7 +43,7 @@ public:
     EXPECT_CALL(os_sys_calls_, bind(_, _, _)).Times(2);
 
     // Test we match the correct stat with empty-slots before, after, or both.
-    hot_restart_ = std::make_unique<HotRestartImpl>(0, 0);
+    hot_restart_ = std::make_unique<HotRestartImpl>(0, 0, "@envoy_domain_socket", 0);
     hot_restart_->drainParentListeners();
 
     // We close both sockets.
@@ -83,20 +83,22 @@ TEST_F(HotRestartImplTest, VersionString) {
 // Test that HotRestartDomainSocketInUseException is thrown when the domain socket is already
 // in use,
 TEST_F(HotRestartImplTest, DomainSocketAlreadyInUse) {
-  EXPECT_CALL(os_sys_calls_, bind(_, _, _)).WillOnce(Return(Api::SysCallIntResult{-1, EADDRINUSE}));
+  EXPECT_CALL(os_sys_calls_, bind(_, _, _))
+      .WillOnce(Return(Api::SysCallIntResult{-1, SOCKET_ERROR_ADDR_IN_USE}));
   EXPECT_CALL(os_sys_calls_, close(_)).Times(1);
 
-  EXPECT_THROW(std::make_unique<HotRestartImpl>(0, 0),
+  EXPECT_THROW(std::make_unique<HotRestartImpl>(0, 0, "@envoy_domain_socket", 0),
                Server::HotRestartDomainSocketInUseException);
 }
 
 // Test that EnvoyException is thrown when the domain socket bind fails for reasons other than
 // being in use.
 TEST_F(HotRestartImplTest, DomainSocketError) {
-  EXPECT_CALL(os_sys_calls_, bind(_, _, _)).WillOnce(Return(Api::SysCallIntResult{-1, EACCES}));
+  EXPECT_CALL(os_sys_calls_, bind(_, _, _))
+      .WillOnce(Return(Api::SysCallIntResult{-1, SOCKET_ERROR_ACCESS}));
   EXPECT_CALL(os_sys_calls_, close(_)).Times(1);
 
-  EXPECT_THROW(std::make_unique<HotRestartImpl>(0, 0), EnvoyException);
+  EXPECT_THROW(std::make_unique<HotRestartImpl>(0, 0, "@envoy_domain_socket", 0), EnvoyException);
 }
 
 } // namespace

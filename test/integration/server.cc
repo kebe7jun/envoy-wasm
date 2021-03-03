@@ -5,10 +5,10 @@
 
 #include "envoy/http/header_map.h"
 
+#include "common/common/random_generator.h"
 #include "common/common/thread.h"
 #include "common/local_info/local_info_impl.h"
 #include "common/network/utility.h"
-#include "common/stats/symbol_table_creator.h"
 #include "common/stats/thread_local_store.h"
 #include "common/thread_local/thread_local_impl.h"
 
@@ -17,10 +17,9 @@
 #include "server/process_context_impl.h"
 
 #include "test/common/runtime/utility.h"
-#include "test/integration/integration.h"
 #include "test/integration/utility.h"
+#include "test/mocks/common.h"
 #include "test/mocks/runtime/mocks.h"
-#include "test/mocks/server/mocks.h"
 #include "test/test_common/environment.h"
 
 #include "absl/strings/str_replace.h"
@@ -177,11 +176,11 @@ void IntegrationTestServer::threadRoutine(const Network::Address::IpVersion vers
                                                     concurrency, drain_time, drain_strategy));
   Thread::MutexBasicLockable lock;
 
-  Runtime::RandomGeneratorPtr random_generator;
+  Random::RandomGeneratorPtr random_generator;
   if (deterministic) {
-    random_generator = std::make_unique<testing::NiceMock<Runtime::MockRandomGenerator>>();
+    random_generator = std::make_unique<testing::NiceMock<Random::MockRandomGenerator>>();
   } else {
-    random_generator = std::make_unique<Runtime::RandomGeneratorImpl>();
+    random_generator = std::make_unique<Random::RandomGeneratorImpl>();
   }
   createAndRunEnvoyServer(options, time_system_, Network::Utility::getLocalAddress(version), *this,
                           lock, *this, std::move(random_generator), process_object);
@@ -190,18 +189,17 @@ void IntegrationTestServer::threadRoutine(const Network::Address::IpVersion vers
 IntegrationTestServerImpl::IntegrationTestServerImpl(Event::TestTimeSystem& time_system,
                                                      Api::Api& api, const std::string& config_path,
                                                      bool use_real_stats)
-    : IntegrationTestServer(time_system, api, config_path),
-      symbol_table_(Stats::SymbolTableCreator::makeSymbolTable()) {
+    : IntegrationTestServer(time_system, api, config_path) {
   stats_allocator_ =
-      (use_real_stats ? std::make_unique<Stats::AllocatorImpl>(*symbol_table_)
-                      : std::make_unique<Stats::NotifyingAllocatorImpl>(*symbol_table_));
+      (use_real_stats ? std::make_unique<Stats::AllocatorImpl>(symbol_table_)
+                      : std::make_unique<Stats::NotifyingAllocatorImpl>(symbol_table_));
 }
 
 void IntegrationTestServerImpl::createAndRunEnvoyServer(
     OptionsImpl& options, Event::TimeSystem& time_system,
     Network::Address::InstanceConstSharedPtr local_address, ListenerHooks& hooks,
     Thread::BasicLockable& access_log_lock, Server::ComponentFactory& component_factory,
-    Runtime::RandomGeneratorPtr&& random_generator, ProcessObjectOptRef process_object) {
+    Random::RandomGeneratorPtr&& random_generator, ProcessObjectOptRef process_object) {
   {
     Init::ManagerImpl init_manager{"Server"};
     Server::HotRestartNopImpl restarter;

@@ -1,75 +1,145 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_library",
     "envoy_package",
 )
-load("//bazel/wasm:wasm.bzl", "wasm_cc_binary")
+load("//bazel/wasm:wasm.bzl", "envoy_wasm_cc_binary", "wasm_rust_binary")
+
+licenses(["notice"])  # Apache 2
 
 envoy_package()
 
-wasm_cc_binary(
-    name = "async_call_cpp.wasm",
-    srcs = ["async_call_cpp.cc"],
+wasm_rust_binary(
+    name = "async_call_rust.wasm",
+    srcs = ["async_call_rust/src/lib.rs"],
     deps = [
-        "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics",
+        "//bazel/external/cargo:log",
+        "//bazel/external/cargo:proxy_wasm",
     ],
 )
 
-wasm_cc_binary(
-    name = "body_cpp.wasm",
-    srcs = ["body_cpp.cc"],
+wasm_rust_binary(
+    name = "body_rust.wasm",
+    srcs = ["body_rust/src/lib.rs"],
     deps = [
-        "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics",
+        "//bazel/external/cargo:log",
+        "//bazel/external/cargo:proxy_wasm",
     ],
 )
 
-wasm_cc_binary(
-    name = "grpc_call_cpp.wasm",
-    srcs = ["grpc_call_cpp.cc"],
+wasm_rust_binary(
+    name = "headers_rust.wasm",
+    srcs = ["headers_rust/src/lib.rs"],
     deps = [
-        "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics_lite",
+        "//bazel/external/cargo:log",
+        "//bazel/external/cargo:proxy_wasm",
     ],
 )
 
-wasm_cc_binary(
-    name = "headers_cpp.wasm",
-    srcs = ["headers_cpp.cc"],
+wasm_rust_binary(
+    name = "metadata_rust.wasm",
+    srcs = ["metadata_rust/src/lib.rs"],
     deps = [
-        "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics",
+        "//bazel/external/cargo:log",
+        "//bazel/external/cargo:proxy_wasm",
     ],
 )
 
-wasm_cc_binary(
-    name = "metadata_cpp.wasm",
-    srcs = ["metadata_cpp.cc"],
+wasm_rust_binary(
+    name = "shared_data_rust.wasm",
+    srcs = ["shared_data_rust/src/lib.rs"],
     deps = [
+        "//bazel/external/cargo:log",
+        "//bazel/external/cargo:proxy_wasm",
+    ],
+)
+
+wasm_rust_binary(
+    name = "shared_queue_rust.wasm",
+    srcs = ["shared_queue_rust/src/lib.rs"],
+    deps = [
+        "//bazel/external/cargo:log",
+        "//bazel/external/cargo:proxy_wasm",
+    ],
+)
+
+envoy_cc_library(
+    name = "test_cpp_plugin",
+    srcs = [
+        "test_async_call_cpp.cc",
+        "test_body_cpp.cc",
+        "test_cpp.cc",
+        "test_cpp_null_plugin.cc",
+        "test_grpc_call_cpp.cc",
+        "test_grpc_stream_cpp.cc",
+        "test_shared_data_cpp.cc",
+        "test_shared_queue_cpp.cc",
+    ],
+    copts = ["-DNULL_PLUGIN=1"],
+    deps = [
+        ":test_cc_proto",
+        "//external:abseil_node_hash_map",
+        "//source/common/common:assert_lib",
+        "//source/common/common:c_smart_ptr_lib",
+        "//source/extensions/common/wasm:wasm_hdr",
+        "//source/extensions/common/wasm:wasm_lib",
+        "//source/extensions/common/wasm:well_known_names",
+        "//source/extensions/common/wasm/ext:envoy_null_plugin",
+        "@proxy_wasm_cpp_sdk//contrib:contrib_lib",
+    ],
+)
+
+envoy_wasm_cc_binary(
+    name = "test_cpp.wasm",
+    srcs = [
+        "test_async_call_cpp.cc",
+        "test_body_cpp.cc",
+        "test_cpp.cc",
+        "test_grpc_call_cpp.cc",
+        "test_grpc_stream_cpp.cc",
+        "test_shared_data_cpp.cc",
+        "test_shared_queue_cpp.cc",
+    ],
+    deps = [
+        ":test_cc_proto",
+        "//source/extensions/common/wasm/ext:declare_property_cc_proto",
+        "//source/extensions/common/wasm/ext:envoy_proxy_wasm_api_lib",
         "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics_lite",
         "@proxy_wasm_cpp_sdk//contrib:contrib_lib",
     ],
 )
 
-wasm_cc_binary(
-    name = "queue_cpp.wasm",
-    srcs = ["queue_cpp.cc"],
+# NB: this target is compiled both to native code and to Wasm. Hence the generic rule.
+proto_library(
+    name = "test_proto",
+    srcs = ["test.proto"],
     deps = [
-        "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics",
+        "@com_google_protobuf//:any_proto",
+        "@com_google_protobuf//:timestamp_proto",
     ],
 )
 
-wasm_cc_binary(
-    name = "root_id_cpp.wasm",
-    srcs = ["root_id_cpp.cc"],
-    deps = [
-        "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics",
-    ],
+# NB: this target is compiled both to native code and to Wasm. Hence the generic rule.
+cc_proto_library(
+    name = "test_cc_proto",
+    deps = [":test_proto"],
 )
 
-wasm_cc_binary(
-    name = "shared_cpp.wasm",
-    srcs = ["shared_cpp.cc"],
-    deps = [
-        "@proxy_wasm_cpp_sdk//:proxy_wasm_intrinsics",
-    ],
-)
+# TODO: FIXME
+#
+#filegroup(
+#    name = "wavm_binary",
+#    srcs = ["//bazel/foreign_cc:wavm"],
+#    output_group = "wavm",
+#)
+#
+#genrule(
+#    name = "test_cpp_wavm_compile",
+#    srcs = [":test_cpp.wasm"],
+#    outs = ["test_cpp.wavm_compiled.wasm"],
+#    cmd = "./$(location wavm_binary) compile $(location test_cpp.wasm) $(location test_cpp.wavm_compiled.wasm)",
+#    tools = [
+#        ":test_cpp.wasm",
+#        ":wavm_binary",
+#    ],
+#)

@@ -18,7 +18,8 @@ namespace Envoy {
  */
 class IntegrationCodecClient : public Http::CodecClientProd {
 public:
-  IntegrationCodecClient(Event::Dispatcher& dispatcher, Network::ClientConnectionPtr&& conn,
+  IntegrationCodecClient(Event::Dispatcher& dispatcher, Random::RandomGenerator& random,
+                         Network::ClientConnectionPtr&& conn,
                          Upstream::HostDescriptionConstSharedPtr host_description,
                          Http::CodecClient::Type type);
 
@@ -61,7 +62,7 @@ private:
     CodecCallbacks(IntegrationCodecClient& parent) : parent_(parent) {}
 
     // Http::ConnectionCallbacks
-    void onGoAway() override { parent_.saw_goaway_ = true; }
+    void onGoAway(Http::GoAwayErrorCode) override { parent_.saw_goaway_ = true; }
 
     IntegrationCodecClient& parent_;
   };
@@ -104,9 +105,12 @@ public:
 protected:
   void useAccessLog(absl::string_view format = "");
 
+  Network::TransportSocketFactoryPtr createUpstreamTlsContext();
   IntegrationCodecClientPtr makeHttpConnection(uint32_t port);
   // Makes a http connection object without checking its connected state.
-  virtual IntegrationCodecClientPtr makeRawHttpConnection(Network::ClientConnectionPtr&& conn);
+  virtual IntegrationCodecClientPtr makeRawHttpConnection(
+      Network::ClientConnectionPtr&& conn,
+      absl::optional<envoy::config::core::v3::Http2ProtocolOptions> http2_options);
   // Makes a http connection object with asserting a connected state.
   IntegrationCodecClientPtr makeHttpConnection(Network::ClientConnectionPtr&& conn);
 
@@ -196,6 +200,7 @@ protected:
   void testLargeHeaders(Http::TestRequestHeaderMapImpl request_headers,
                         Http::TestRequestTrailerMapImpl request_trailers, uint32_t size,
                         uint32_t max_size);
+  void testLargeRequestUrl(uint32_t url_size, uint32_t max_headers_size);
   void testLargeRequestHeaders(uint32_t size, uint32_t count, uint32_t max_size = 60,
                                uint32_t max_count = 100);
   void testLargeRequestTrailers(uint32_t size, uint32_t max_size = 60);
@@ -209,8 +214,9 @@ protected:
 
   void testEnvoyHandling100Continue(bool additional_continue_from_upstream = false,
                                     const std::string& via = "");
-  void testEnvoyProxying100Continue(bool continue_before_upstream_complete = false,
-                                    bool with_encoder_filter = false);
+  void testEnvoyProxying1xx(bool continue_before_upstream_complete = false,
+                            bool with_encoder_filter = false,
+                            bool with_multiple_1xx_headers = false);
 
   // HTTP/2 client tests.
   void testDownstreamResetBeforeResponseComplete();
@@ -245,5 +251,6 @@ protected:
   uint32_t max_request_headers_kb_{Http::DEFAULT_MAX_REQUEST_HEADERS_KB};
   uint32_t max_request_headers_count_{Http::DEFAULT_MAX_HEADERS_COUNT};
   std::string access_log_name_;
+  testing::NiceMock<Random::MockRandomGenerator> random_;
 };
 } // namespace Envoy

@@ -69,7 +69,7 @@ static_resources:
         address: 127.0.0.1
         port_value: 0
 )EOF",
-                     TestEnvironment::nullDevicePath(), TestEnvironment::nullDevicePath());
+                     Platform::null_device_path, Platform::null_device_path);
 }
 
 std::string ConfigHelper::baseUdpListenerConfig() {
@@ -100,7 +100,7 @@ static_resources:
         port_value: 0
         protocol: udp
 )EOF",
-                     TestEnvironment::nullDevicePath());
+                     Platform::null_device_path);
 }
 
 std::string ConfigHelper::tcpProxyConfig() {
@@ -153,7 +153,7 @@ std::string ConfigHelper::httpProxyConfig() {
               domains: "*"
             name: route_config_0
 )EOF",
-                                                TestEnvironment::nullDevicePath()));
+                                                Platform::null_device_path));
 }
 
 // TODO(danzh): For better compatibility with HTTP integration test framework,
@@ -192,7 +192,7 @@ std::string ConfigHelper::quicHttpProxyConfig() {
     udp_listener_config:
       udp_listener_name: "quiche_quic_listener"
 )EOF",
-                                                           TestEnvironment::nullDevicePath()));
+                                                           Platform::null_device_path));
 }
 
 std::string ConfigHelper::defaultBufferFilter() {
@@ -309,7 +309,7 @@ static_resources:
                   prefix: "/cluster2"
               domains: "*"
 )EOF",
-      TestEnvironment::nullDevicePath(), api_type);
+      Platform::null_device_path, api_type);
 }
 
 // TODO(#6327) cleaner approach to testing with static config.
@@ -351,7 +351,7 @@ admin:
       port_value: 0
 )EOF",
                      api_type, api_version == envoy::config::core::v3::ApiVersion::V2 ? "V2" : "V3",
-                     TestEnvironment::nullDevicePath());
+                     Platform::null_device_path);
 }
 
 // TODO(samflattery): bundle this up with buildCluster
@@ -394,6 +394,37 @@ ConfigHelper::buildCluster(const std::string& name, const std::string& lb_policy
     )EOF",
                                         name, apiVersionStr(api_version), lb_policy),
                             cluster, shouldBoost(api_version));
+  return cluster;
+}
+
+envoy::config::cluster::v3::Cluster
+ConfigHelper::buildTlsCluster(const std::string& name, const std::string& lb_policy,
+                              envoy::config::core::v3::ApiVersion api_version) {
+  API_NO_BOOST(envoy::config::cluster::v3::Cluster) cluster;
+  TestUtility::loadFromYaml(
+      fmt::format(R"EOF(
+      name: {}
+      connect_timeout: 5s
+      type: EDS
+      eds_cluster_config:
+        eds_config:
+          resource_api_version: {}
+          ads: {{}}
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: {}
+      lb_policy: {}
+      http2_protocol_options: {{}}
+    )EOF",
+                  name, apiVersionStr(api_version),
+                  TestEnvironment::runfilesPath("test/config/integration/certs/upstreamcacert.pem"),
+                  lb_policy),
+      cluster, shouldBoost(api_version));
   return cluster;
 }
 
@@ -586,6 +617,10 @@ void ConfigHelper::addRuntimeOverride(const std::string& key, const std::string&
   (*static_layer->mutable_fields())[std::string(key)] = ValueUtil::stringValue(std::string(value));
 }
 
+void ConfigHelper::setNewCodecs() {
+  addRuntimeOverride("envoy.reloadable_features.new_codec_behavior", "true");
+}
+
 void ConfigHelper::finalize(const std::vector<uint32_t>& ports) {
   RELEASE_ASSERT(!finalized_, "");
 
@@ -636,11 +671,16 @@ void ConfigHelper::finalize(const std::vector<uint32_t>& ports) {
         for (int k = 0; k < locality_lb->lb_endpoints_size(); ++k) {
           auto lb_endpoint = locality_lb->mutable_lb_endpoints(k);
           if (lb_endpoint->endpoint().address().has_socket_address()) {
-            RELEASE_ASSERT(ports.size() > port_idx, "");
-            lb_endpoint->mutable_endpoint()
-                ->mutable_address()
-                ->mutable_socket_address()
-                ->set_port_value(ports[port_idx++]);
+            if (lb_endpoint->endpoint().address().socket_address().port_value() == 0) {
+              RELEASE_ASSERT(ports.size() > port_idx, "");
+              lb_endpoint->mutable_endpoint()
+                  ->mutable_address()
+                  ->mutable_socket_address()
+                  ->set_port_value(ports[port_idx++]);
+            } else {
+              ENVOY_LOG_MISC(debug, "Not overriding preset port",
+                             lb_endpoint->endpoint().address().socket_address().port_value());
+            }
           }
         }
       }
@@ -864,6 +904,10 @@ void ConfigHelper::addSslConfig(const ServerSslOptions& options) {
       bootstrap_.mutable_static_resources()->mutable_listeners(0)->mutable_filter_chains(0);
   envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
   initializeTls(options, *tls_context.mutable_common_tls_context());
+  if (options.ocsp_staple_required_) {
+    tls_context.set_ocsp_staple_policy(
+        envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext::MUST_STAPLE);
+  }
   filter_chain->mutable_transport_socket()->set_name("envoy.transport_sockets.tls");
   filter_chain->mutable_transport_socket()->mutable_typed_config()->PackFrom(tls_context);
 }
@@ -927,6 +971,10 @@ void ConfigHelper::initializeTls(
         TestEnvironment::runfilesPath("test/config/integration/certs/servercert.pem"));
     tls_certificate->mutable_private_key()->set_filename(
         TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem"));
+    if (options.rsa_cert_ocsp_staple_) {
+      tls_certificate->mutable_ocsp_staple()->set_filename(
+          TestEnvironment::runfilesPath("test/config/integration/certs/server_ocsp_resp.der"));
+    }
   }
   if (options.ecdsa_cert_) {
     auto* tls_certificate = common_tls_context.add_tls_certificates();
@@ -934,6 +982,10 @@ void ConfigHelper::initializeTls(
         TestEnvironment::runfilesPath("test/config/integration/certs/server_ecdsacert.pem"));
     tls_certificate->mutable_private_key()->set_filename(
         TestEnvironment::runfilesPath("test/config/integration/certs/server_ecdsakey.pem"));
+    if (options.ecdsa_cert_ocsp_staple_) {
+      tls_certificate->mutable_ocsp_staple()->set_filename(TestEnvironment::runfilesPath(
+          "test/config/integration/certs/server_ecdsa_ocsp_resp.der"));
+    }
   }
 }
 

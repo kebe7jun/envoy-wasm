@@ -114,7 +114,7 @@ TEST_P(LocalJwksIntegrationTest, WithGoodToken) {
   EXPECT_TRUE(payload_entry != nullptr);
   EXPECT_EQ(payload_entry->value().getStringView(), ExpectedPayloadValue);
   // Verify the token is removed.
-  EXPECT_FALSE(upstream_request_->headers().Authorization());
+  EXPECT_EQ(nullptr, upstream_request_->headers().get(Http::CustomHeaders::get().Authorization));
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   response->waitForEndStream();
   ASSERT_TRUE(response->complete());
@@ -309,8 +309,7 @@ public:
   void createUpstreams() override {
     HttpProtocolIntegrationTest::createUpstreams();
     // for Jwks upstream.
-    fake_upstreams_.emplace_back(
-        new FakeUpstream(0, GetParam().upstream_protocol, version_, timeSystem()));
+    addFakeUpstream(GetParam().upstream_protocol);
   }
 
   void initializeFilter(bool add_cluster) {
@@ -392,7 +391,7 @@ TEST_P(RemoteJwksIntegrationTest, WithGoodToken) {
   EXPECT_TRUE(payload_entry != nullptr);
   EXPECT_EQ(payload_entry->value().getStringView(), ExpectedPayloadValue);
   // Verify the token is removed.
-  EXPECT_FALSE(upstream_request_->headers().Authorization());
+  EXPECT_EQ(nullptr, upstream_request_->headers().get(Http::CustomHeaders::get().Authorization));
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 

@@ -9,7 +9,7 @@
 #include "extensions/filters/http/admission_control/evaluators/success_criteria_evaluator.h"
 
 #include "test/mocks/runtime/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/factory_context.h"
 #include "test/mocks/thread_local/mocks.h"
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/utility.h"
@@ -35,16 +35,15 @@ public:
     TestUtility::loadFromYamlAndValidate(yaml, proto);
     auto tls = context_.threadLocal().allocateSlot();
     auto evaluator = std::make_unique<SuccessCriteriaEvaluator>(proto.success_criteria());
-    return std::make_shared<AdmissionControlFilterConfig>(
-        proto, runtime_, time_system_, random_, scope_, std::move(tls), std::move(evaluator));
+    return std::make_shared<AdmissionControlFilterConfig>(proto, runtime_, random_, scope_,
+                                                          std::move(tls), std::move(evaluator));
   }
 
 protected:
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Server::Configuration::MockFactoryContext> context_;
   Stats::IsolatedStoreImpl scope_;
-  Event::SimulatedTimeSystem time_system_;
-  NiceMock<Runtime::MockRandomGenerator> random_;
+  NiceMock<Random::MockRandomGenerator> random_;
 };
 
 // Verify the configuration when all fields are set.
@@ -54,7 +53,11 @@ enabled:
   default_value: false
   runtime_key: "foo.enabled"
 sampling_window: 1337s
-aggression_coefficient:
+sr_threshold:
+  default_value:
+    value: 92
+  runtime_key: "foo.sr_threshold"
+aggression:
   default_value: 4.2
   runtime_key: "foo.aggression"
 success_criteria:
@@ -66,6 +69,7 @@ success_criteria:
 
   EXPECT_FALSE(config->filterEnabled());
   EXPECT_EQ(4.2, config->aggression());
+  EXPECT_EQ(0.92, config->successRateThreshold());
 }
 
 // Verify the config defaults when not specified.
@@ -81,7 +85,8 @@ success_criteria:
   auto config = makeConfig(yaml);
 
   EXPECT_TRUE(config->filterEnabled());
-  EXPECT_EQ(2.0, config->aggression());
+  EXPECT_EQ(1.0, config->aggression());
+  EXPECT_EQ(0.95, config->successRateThreshold());
 }
 
 // Ensure runtime fields are honored.
@@ -91,7 +96,11 @@ enabled:
   default_value: false
   runtime_key: "foo.enabled"
 sampling_window: 1337s
-aggression_coefficient:
+sr_threshold:
+  default_value:
+    value: 92
+  runtime_key: "foo.sr_threshold"
+aggression:
   default_value: 4.2
   runtime_key: "foo.aggression"
 success_criteria:
@@ -105,6 +114,14 @@ success_criteria:
   EXPECT_TRUE(config->filterEnabled());
   EXPECT_CALL(runtime_.snapshot_, getDouble("foo.aggression", 4.2)).WillOnce(Return(1.3));
   EXPECT_EQ(1.3, config->aggression());
+  EXPECT_CALL(runtime_.snapshot_, getDouble("foo.sr_threshold", 92)).WillOnce(Return(24.0));
+  EXPECT_EQ(0.24, config->successRateThreshold());
+
+  // Verify bogus runtime thresholds revert to the default value.
+  EXPECT_CALL(runtime_.snapshot_, getDouble("foo.sr_threshold", 92)).WillOnce(Return(250.0));
+  EXPECT_EQ(0.92, config->successRateThreshold());
+  EXPECT_CALL(runtime_.snapshot_, getDouble("foo.sr_threshold", 92)).WillOnce(Return(-1.0));
+  EXPECT_EQ(0.92, config->successRateThreshold());
 }
 
 } // namespace

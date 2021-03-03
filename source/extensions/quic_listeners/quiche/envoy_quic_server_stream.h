@@ -1,13 +1,16 @@
 #pragma once
 
+#if defined(__GNUC__)
 #pragma GCC diagnostic push
-// QUICHE allows unused parameters.
 #pragma GCC diagnostic ignored "-Wunused-parameter"
-// QUICHE uses offsetof().
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+
 #include "quiche/quic/core/http/quic_spdy_server_stream_base.h"
 
+#if defined(__GNUC__)
 #pragma GCC diagnostic pop
+#endif
 
 #include "extensions/quic_listeners/quiche/envoy_quic_stream.h"
 
@@ -36,9 +39,13 @@ public:
   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override {
     return absl::nullopt;
   }
+  bool streamErrorOnInvalidHttpMessage() const override { return false; }
 
   // Http::Stream
   void resetStream(Http::StreamResetReason reason) override;
+  void setFlushTimeout(std::chrono::milliseconds) override {
+    // TODO(mattklein123): Actually implement this for HTTP/3 similar to HTTP/2.
+  }
   // quic::QuicSpdyStream
   void OnBodyAvailable() override;
   void OnStreamReset(const quic::QuicRstStreamFrame& frame) override;

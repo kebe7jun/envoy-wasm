@@ -161,9 +161,10 @@ Buffer::InstancePtr Common::serializeMessage(const Protobuf::Message& message) {
   return body;
 }
 
-std::chrono::milliseconds Common::getGrpcTimeout(const Http::RequestHeaderMap& request_headers) {
-  std::chrono::milliseconds timeout(0);
+absl::optional<std::chrono::milliseconds>
+Common::getGrpcTimeout(const Http::RequestHeaderMap& request_headers) {
   const Http::HeaderEntry* header_grpc_timeout_entry = request_headers.GrpcTimeout();
+  std::chrono::milliseconds timeout;
   if (header_grpc_timeout_entry) {
     uint64_t grpc_timeout;
     // TODO(dnoe): Migrate to pure string_view (#6580)
@@ -172,16 +173,13 @@ std::chrono::milliseconds Common::getGrpcTimeout(const Http::RequestHeaderMap& r
     if (unit != nullptr && *unit != '\0') {
       switch (*unit) {
       case 'H':
-        timeout = std::chrono::hours(grpc_timeout);
-        break;
+        return std::chrono::hours(grpc_timeout);
       case 'M':
-        timeout = std::chrono::minutes(grpc_timeout);
-        break;
+        return std::chrono::minutes(grpc_timeout);
       case 'S':
-        timeout = std::chrono::seconds(grpc_timeout);
-        break;
+        return std::chrono::seconds(grpc_timeout);
       case 'm':
-        timeout = std::chrono::milliseconds(grpc_timeout);
+        return std::chrono::milliseconds(grpc_timeout);
         break;
       case 'u':
         timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -189,18 +187,18 @@ std::chrono::milliseconds Common::getGrpcTimeout(const Http::RequestHeaderMap& r
         if (timeout < std::chrono::microseconds(grpc_timeout)) {
           timeout++;
         }
-        break;
+        return timeout;
       case 'n':
         timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::nanoseconds(grpc_timeout));
         if (timeout < std::chrono::nanoseconds(grpc_timeout)) {
           timeout++;
         }
-        break;
+        return timeout;
       }
     }
   }
-  return timeout;
+  return absl::nullopt;
 }
 
 void Common::toGrpcTimeout(const std::chrono::milliseconds& timeout,
@@ -225,13 +223,13 @@ void Common::toGrpcTimeout(const std::chrono::milliseconds& timeout,
 }
 
 Http::RequestMessagePtr
-Common::prepareHeaders(const std::string& upstream_cluster, const std::string& service_full_name,
+Common::prepareHeaders(const std::string& host_name, const std::string& service_full_name,
                        const std::string& method_name,
                        const absl::optional<std::chrono::milliseconds>& timeout) {
   Http::RequestMessagePtr message(new Http::RequestMessageImpl());
   message->headers().setReferenceMethod(Http::Headers::get().MethodValues.Post);
   message->headers().setPath(absl::StrCat("/", service_full_name, "/", method_name));
-  message->headers().setHost(upstream_cluster);
+  message->headers().setHost(host_name);
   // According to https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md TE should appear
   // before Timeout and ContentType.
   message->headers().setReferenceTE(Http::Headers::get().TEValues.Trailers);

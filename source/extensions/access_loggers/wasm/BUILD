@@ -2,14 +2,14 @@ load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
 licenses(["notice"])  # Apache 2
 
-# Access log implementation that calls into a WASM VM.
+envoy_extension_package()
 
-envoy_package()
+# Access log implementation that calls into a WASM VM.
 
 envoy_cc_library(
     name = "wasm_access_log_lib",
@@ -17,6 +17,8 @@ envoy_cc_library(
     deps = [
         "//include/envoy/access_log:access_log_interface",
         "//source/common/http:header_map_lib",
+        "//source/extensions/access_loggers:well_known_names",
+        "//source/extensions/common/wasm:wasm_lib",
     ],
 )
 
@@ -25,6 +27,7 @@ envoy_cc_extension(
     srcs = ["config.cc"],
     hdrs = ["config.h"],
     security_posture = "unknown",
+    status = "alpha",
     deps = [
         ":wasm_access_log_lib",
         "//include/envoy/registry",

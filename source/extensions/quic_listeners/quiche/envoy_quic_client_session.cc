@@ -1,5 +1,7 @@
 #include "extensions/quic_listeners/quiche/envoy_quic_client_session.h"
 
+#include "extensions/quic_listeners/quiche/envoy_quic_utils.h"
+
 namespace Envoy {
 namespace Quic {
 
@@ -58,7 +60,16 @@ void EnvoyQuicClientSession::OnGoAway(const quic::QuicGoAwayFrame& frame) {
                  quic::QuicErrorCodeToString(frame.error_code), frame.reason_phrase);
   quic::QuicSpdyClientSession::OnGoAway(frame);
   if (http_connection_callbacks_ != nullptr) {
-    http_connection_callbacks_->onGoAway();
+    http_connection_callbacks_->onGoAway(quicErrorCodeToEnvoyErrorCode(frame.error_code));
+  }
+}
+
+void EnvoyQuicClientSession::OnHttp3GoAway(uint64_t stream_id) {
+  ENVOY_CONN_LOG(debug, "HTTP/3 GOAWAY received", *this);
+  quic::QuicSpdyClientSession::OnHttp3GoAway(stream_id);
+  if (http_connection_callbacks_ != nullptr) {
+    // HTTP/3 GOAWAY doesn't have an error code field.
+    http_connection_callbacks_->onGoAway(Http::GoAwayErrorCode::NoError);
   }
 }
 
@@ -88,7 +99,7 @@ EnvoyQuicClientSession::CreateIncomingStream(quic::PendingStream* /*pending*/) {
 
 bool EnvoyQuicClientSession::hasDataToWrite() { return HasDataToWrite(); }
 
-void EnvoyQuicClientSession::OnOneRttKeysAvailable() {
+void EnvoyQuicClientSession::OnTlsHandshakeComplete() {
   raiseConnectionEvent(Network::ConnectionEvent::Connected);
 }
 

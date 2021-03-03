@@ -5,9 +5,9 @@
 #include "envoy/service/accesslog/v3/als.pb.h"
 
 #include "common/buffer/zero_copy_input_stream_impl.h"
-#include "common/common/version.h"
 #include "common/grpc/codec.h"
 #include "common/grpc/common.h"
+#include "common/version/version.h"
 
 #include "test/common/grpc/grpc_client_integration.h"
 #include "test/integration/http_integration.h"
@@ -34,8 +34,7 @@ public:
 
   void createUpstreams() override {
     BaseIntegrationTest::createUpstreams();
-    fake_upstreams_.emplace_back(
-        new FakeUpstream(0, FakeHttpConnection::Type::HTTP2, version_, timeSystem()));
+    addFakeUpstream(FakeHttpConnection::Type::HTTP2);
   }
 
   void initialize() override {
@@ -136,11 +135,11 @@ TEST_P(TcpGrpcAccessLogIntegrationTest, BasicAccessLogFlow) {
 
   ASSERT_TRUE(fake_upstream_connection->write("hello"));
   tcp_client->waitForData("hello");
-  tcp_client->write("bar", false);
+  ASSERT_TRUE(tcp_client->write("bar", false));
 
   ASSERT_TRUE(fake_upstream_connection->write("", true));
   tcp_client->waitForHalfClose();
-  tcp_client->write("", true);
+  ASSERT_TRUE(tcp_client->write("", true));
 
   ASSERT_TRUE(fake_upstream_connection->waitForData(3));
   ASSERT_TRUE(fake_upstream_connection->waitForHalfClose());

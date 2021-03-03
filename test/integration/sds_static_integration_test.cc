@@ -17,7 +17,6 @@
 #include "test/integration/server.h"
 #include "test/integration/ssl_utility.h"
 #include "test/mocks/secret/mocks.h"
-#include "test/mocks/server/mocks.h"
 #include "test/test_common/network_utility.h"
 #include "test/test_common/test_time_system.h"
 #include "test/test_common/utility.h"
@@ -146,9 +145,8 @@ public:
   }
 
   void createUpstreams() override {
-    fake_upstreams_.emplace_back(new FakeUpstream(createUpstreamSslContext(context_manager_, *api_),
-                                                  0, FakeHttpConnection::Type::HTTP1, version_,
-                                                  timeSystem()));
+    addFakeUpstream(createUpstreamSslContext(context_manager_, *api_),
+                    FakeHttpConnection::Type::HTTP1);
   }
 
 private:

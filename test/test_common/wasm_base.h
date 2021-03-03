@@ -32,33 +32,51 @@ namespace Common {
 namespace Wasm {
 
 #define MOCK_CONTEXT_LOG_                                                                          \
+  using Context::log;                                                                              \
   proxy_wasm::WasmResult log(uint32_t level, absl::string_view message) override {                 \
     log_(static_cast<spdlog::level::level_enum>(level), message);                                  \
     return proxy_wasm::WasmResult::Ok;                                                             \
   }                                                                                                \
   MOCK_METHOD2(log_, void(spdlog::level::level_enum level, absl::string_view message))
 
+class DeferredRunner {
+public:
+  ~DeferredRunner() {
+    if (f_) {
+      f_();
+    }
+  }
+  void setFunction(std::function<void()> f) { f_ = f; }
+
+private:
+  std::function<void()> f_;
+};
+
 template <typename Base = testing::Test> class WasmTestBase : public Base {
 public:
-  void SetUp() override { clearCodeCacheForTesting(false); }
+  // NOLINTNEXTLINE(readability-identifier-naming)
+  void SetUp() override { clearCodeCacheForTesting(); }
 
   void setupBase(const std::string& runtime, const std::string& code, CreateContextFn create_root,
-                 std::string root_id = "") {
+                 std::string root_id = "", std::string vm_configuration = "",
+                 bool fail_open = false, std::string plugin_configuration = "") {
     envoy::extensions::wasm::v3::VmConfig vm_config;
     vm_config.set_vm_id("vm_id");
     vm_config.set_runtime(absl::StrCat("envoy.wasm.runtime.", runtime));
+    ProtobufWkt::StringValue vm_configuration_string;
+    vm_configuration_string.set_value(vm_configuration);
+    vm_config.mutable_configuration()->PackFrom(vm_configuration_string);
     vm_config.mutable_code()->mutable_local()->set_inline_bytes(code);
     Api::ApiPtr api = Api::createApiForTest(stats_store_);
     scope_ = Stats::ScopeSharedPtr(stats_store_.createScope("wasm."));
-    auto name = "";
+    auto name = "plugin_name";
     auto vm_id = "";
-    auto plugin_configuration = "";
     plugin_ = std::make_shared<Extensions::Common::Wasm::Plugin>(
-        name, root_id, vm_id, plugin_configuration, false,
+        name, root_id, vm_id, runtime, plugin_configuration, fail_open,
         envoy::config::core::v3::TrafficDirection::INBOUND, local_info_, &listener_metadata_);
     // Passes ownership of root_context_.
     Extensions::Common::Wasm::createWasm(
-        vm_config, plugin_, scope_, cluster_manager_, init_manager_, dispatcher_, random_, *api,
+        vm_config, plugin_, scope_, cluster_manager_, init_manager_, dispatcher_, *api,
         lifecycle_notifier_, remote_data_provider_,
         [this](WasmHandleSharedPtr wasm) { wasm_ = wasm; }, create_root);
     if (wasm_) {
@@ -72,13 +90,13 @@ public:
   }
 
   WasmHandleSharedPtr& wasm() { return wasm_; }
-  Context* root_context() { return root_context_; }
+  Context* rootContext() { return root_context_; }
 
+  DeferredRunner deferred_runner_;
   Stats::IsolatedStoreImpl stats_store_;
   Stats::ScopeSharedPtr scope_;
   NiceMock<ThreadLocal::MockInstance> tls_;
   NiceMock<Event::MockDispatcher> dispatcher_;
-  NiceMock<Runtime::MockRandomGenerator> random_;
   NiceMock<Upstream::MockClusterManager> cluster_manager_;
   NiceMock<Init::MockManager> init_manager_;
   WasmHandleSharedPtr wasm_;

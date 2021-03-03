@@ -71,7 +71,8 @@ void AdminFilter::onComplete() {
   Http::Code code = admin_server_callback_func_(path, *header_map, response, *this);
   Utility::populateFallbackResponseHeaders(code, *header_map);
   decoder_callbacks_->encodeHeaders(std::move(header_map),
-                                    end_stream_on_complete_ && response.length() == 0);
+                                    end_stream_on_complete_ && response.length() == 0,
+                                    StreamInfo::ResponseCodeDetails::get().AdminFilterResponse);
 
   if (response.length() > 0) {
     decoder_callbacks_->encodeData(response, end_stream_on_complete_);

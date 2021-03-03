@@ -11,6 +11,7 @@
 
 #include "common/common/assert.h"
 #include "common/common/fmt.h"
+#include "common/common/utility.h"
 #include "common/network/address_impl.h"
 #include "common/network/utility.h"
 
@@ -23,9 +24,9 @@ Api::SysCallIntResult ListenSocketImpl::bind(Network::Address::InstanceConstShar
   const Api::SysCallIntResult result = SocketImpl::bind(local_address_);
   if (SOCKET_FAILURE(result.rc_)) {
     close();
-    throw SocketBindException(
-        fmt::format("cannot bind '{}': {}", local_address_->asString(), strerror(result.errno_)),
-        result.errno_);
+    throw SocketBindException(fmt::format("cannot bind '{}': {}", local_address_->asString(),
+                                          errorDetails(result.errno_)),
+                              result.errno_);
   }
   return {0, 0};
 }
@@ -61,15 +62,16 @@ template <>
 void NetworkListenSocket<NetworkSocketTrait<Socket::Type::Datagram>>::setPrebindSocketOptions() {}
 
 UdsListenSocket::UdsListenSocket(const Address::InstanceConstSharedPtr& address)
-    : ListenSocketImpl(SocketInterfaceSingleton::get().socket(Socket::Type::Stream, address),
-                       address) {
-  RELEASE_ASSERT(io_handle_->fd() != -1, "");
+    : ListenSocketImpl(ioHandleForAddr(Socket::Type::Stream, address), address) {
+  RELEASE_ASSERT(io_handle_->isOpen(), "");
   bind(local_address_);
 }
 
 UdsListenSocket::UdsListenSocket(IoHandlePtr&& io_handle,
                                  const Address::InstanceConstSharedPtr& address)
     : ListenSocketImpl(std::move(io_handle), address) {}
+
+std::atomic<uint64_t> AcceptedSocketImpl::global_accepted_socket_count_;
 
 } // namespace Network
 } // namespace Envoy

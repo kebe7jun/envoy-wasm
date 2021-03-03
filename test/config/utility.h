@@ -36,8 +36,23 @@ public:
       return *this;
     }
 
+    ServerSslOptions& setRsaCertOcspStaple(bool rsa_cert_ocsp_staple) {
+      rsa_cert_ocsp_staple_ = rsa_cert_ocsp_staple;
+      return *this;
+    }
+
     ServerSslOptions& setEcdsaCert(bool ecdsa_cert) {
       ecdsa_cert_ = ecdsa_cert;
+      return *this;
+    }
+
+    ServerSslOptions& setEcdsaCertOcspStaple(bool ecdsa_cert_ocsp_staple) {
+      ecdsa_cert_ocsp_staple_ = ecdsa_cert_ocsp_staple;
+      return *this;
+    }
+
+    ServerSslOptions& setOcspStapleRequired(bool ocsp_staple_required) {
+      ocsp_staple_required_ = ocsp_staple_required;
       return *this;
     }
 
@@ -52,7 +67,10 @@ public:
     }
 
     bool rsa_cert_{true};
+    bool rsa_cert_ocsp_staple_{true};
     bool ecdsa_cert_{false};
+    bool ecdsa_cert_ocsp_staple_{false};
+    bool ocsp_staple_required_{false};
     bool tlsv1_3_{false};
     bool expect_client_ecdsa_cert_{false};
   };
@@ -107,6 +125,10 @@ public:
 
   // ADS configurations
   static envoy::config::cluster::v3::Cluster buildCluster(
+      const std::string& name, const std::string& lb_policy = "ROUND_ROBIN",
+      envoy::config::core::v3::ApiVersion api_version = envoy::config::core::v3::ApiVersion::V3);
+
+  static envoy::config::cluster::v3::Cluster buildTlsCluster(
       const std::string& name, const std::string& lb_policy = "ROUND_ROBIN",
       envoy::config::core::v3::ApiVersion api_version = envoy::config::core::v3::ApiVersion::V3);
 
@@ -228,6 +250,9 @@ public:
   void setLocalReply(
       const envoy::extensions::filters::network::http_connection_manager::v3::LocalReplyConfig&
           config);
+
+  // Set new codecs to use for upstream and downstream codecs.
+  void setNewCodecs();
 
 private:
   static bool shouldBoost(envoy::config::core::v3::ApiVersion api_version) {
